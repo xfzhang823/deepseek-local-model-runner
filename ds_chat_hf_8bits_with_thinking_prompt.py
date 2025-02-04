@@ -26,8 +26,23 @@ logger = logging.getLogger(__name__)
 
 def load_model() -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
     """
-    Load the model and tokenizer with 8-bit quantization configuration.
-    The model is dynamically loaded based on the environment variables.
+    Load the model and tokenizer with 8-bit quantization configuration to optimize memory usage
+    and inference performance.
+
+    This function loads the model and tokenizer dynamically based on the environment variables.
+    It also configures the model for 8-bit quantization, which reduces the memory footprint
+    and speeds up inference, with the additional flexibility to control how much of the model
+    is quantized via the 'llm_int8_threshold'.
+
+    The quantization is performed using the `BitsAndBytesConfig`:
+    - `load_in_8bit=True` ensures that the model weights are loaded in 8-bit precision (INT8),
+        reducing the model's memory requirements.
+    - `llm_int8_threshold=6.0` specifies a threshold for applying 8-bit quantization.
+    Weights with magnitudes larger than this threshold will be quantized to 8-bit precision,
+    while smaller weights may remain in higher precision to retain accuracy.
+
+    The model is loaded in a way that allows it to automatically balance between CPU
+    and GPU resources.
 
     Returns:
         Tuple: The tokenizer and model objects.
@@ -64,7 +79,7 @@ def generate_chat_response(
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
-) -> str:
+) -> Tuple[str, str]:
     """
         Generate a response from the model based on the input prompt.
 
@@ -92,14 +107,23 @@ def generate_chat_response(
         threshold is met, balancing diversity and coherence, often used in combination
         with top-k.
     """
+
+    # Add a "thinking" instruction to the prompt
+    thinking_prompt = f"""
+    Question: {prompt}
+    <think>
+    Please reason through the problem step by step without repeating yourself. \
+Each step should be concise and progress logically toward the final answer:
+    """
+
     # Tokenize the input prompt
-    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = tokenizer(thinking_prompt, return_tensors="pt")
 
     # Move input tensors to the same device as the model
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
 
-    # Start timing the response generation process
+    # Start timing the thinking process
     start_time = time.time()
 
     # Generate logits and outputs
@@ -114,23 +138,31 @@ def generate_chat_response(
             top_p=top_p,
         )
 
-        logger.debug(
+        logger.info(
             f"Intermediate logits shape: {logits.shape}"
         )  # Debugging: inspect logits
 
-    # Calculate the time elapsed for thinking
     elapsed_time = time.time() - start_time
     minutes, seconds = divmod(elapsed_time, 60)
     time_str = f"{int(minutes):02}:{int(seconds):02}"
 
     # Decode the full response
-    final_answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # Log the thinking time and final response
+    # Extract the "thinking" part and the final answer
+    if "<think>" in full_response and "</think>" in full_response:
+        thinking_part = full_response.split("<think>")[1].split("</think>")[0].strip()
+        final_answer = full_response.split("</think>")[1].strip()
+    else:
+        thinking_part = "No thinking steps captured."
+        final_answer = full_response
+
+    # Log the thinking steps and final answer
     logger.info(f"Thinking time: {time_str}")
-    logger.info(f"Response from generate_chat_response function:\n{final_answer}")
+    logger.info(f"\nThinking Steps:\n{thinking_part}")
+    logger.info(f"\nFinal Answer:\n{final_answer}")
 
-    return final_answer
+    return thinking_part, final_answer
 
 
 def main():
@@ -146,11 +178,12 @@ def main():
             break
 
         # Generate and display the response
-        final_output = generate_chat_response(
-            prompt=user_input, tokenizer=tokenizer, model=model, max_length=1000
+        thinking_output, final_output = generate_chat_response(
+            prompt=user_input, tokenizer=tokenizer, model=model, max_length=2000
         )
+        print(f"DeepSeek (Thinking Steps): {thinking_output}")
         print(f"DeepSeek (Final Answer): {final_output}")
-        logger.info(f"Response: {final_output}")
+        logger.info(f"Response: {thinking_output} | {final_output}")
 
 
 if __name__ == "__main__":

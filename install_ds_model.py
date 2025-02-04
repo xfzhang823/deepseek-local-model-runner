@@ -1,6 +1,13 @@
+"""
+Install the DeepSeek model
+
+Only need to run this code once.
+"""
+
+import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dotenv import load_dotenv
-import os
+
 
 load_dotenv()
 token = os.getenv("HUGGING_FACE_TOKEN")
