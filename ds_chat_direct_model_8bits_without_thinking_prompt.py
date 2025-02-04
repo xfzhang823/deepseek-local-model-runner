@@ -45,6 +45,7 @@ def load_model() -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
         llm_int8_threshold=6.0,
     )
 
+    # Load model
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",  #! Dynamically balancing between CPU and GPU

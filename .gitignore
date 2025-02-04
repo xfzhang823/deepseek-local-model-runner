@@ -28,3 +28,10 @@ node_modules/
 
 # Ignore documentation files
 docs/
+
+# Unfinished files to ignore
+main_chat.py
+test_chat_with_pipeline.py
+
+# Folders not to be share
+sandbox/
