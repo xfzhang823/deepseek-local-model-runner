@@ -118,12 +118,12 @@ def generate_chat_response(
     start_time = time.time()
 
     # Generate logits and outputs
-    with torch.no_grad():
+    with torch.no_grad():  # Do not compute grad. descent/no training involved
         logits = model(**inputs).logits
         outputs = model.generate(
             **inputs,
             max_length=max_length,
-            do_sample=True,
+            do_sample=True,  # have multi-options (tokens) picks 1 based on prob.
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,

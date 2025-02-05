@@ -132,7 +132,7 @@ Each step should be concise and progress logically toward the final answer:
         outputs = model.generate(
             **inputs,
             max_length=max_length,
-            do_sample=True,
+            do_sample=True,  # have multi-options (tokens) picks 1 based on prob.
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
