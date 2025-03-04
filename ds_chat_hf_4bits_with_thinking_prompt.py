@@ -13,9 +13,9 @@ broken down into dedicated functions.
 
 import logging
 import os
-from typing import Tuple
 import time
 from dotenv import load_dotenv
+from typing import Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import logging_config
@@ -41,10 +41,6 @@ def load_model() -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
     Weights with magnitudes larger than this threshold will be quantized to 8-bit precision,
     while smaller weights may remain in higher precision to retain accuracy.
 
-    * Why 6: More of a Rule of Thumb. The value 6.0 is a good starting point for
-    * llm_int8_threshold based on empirical evidences, because it balances memory savings
-    * and accuracy for many models.
-
     The model is loaded in a way that allows it to automatically balance between CPU
     and GPU resources.
 
@@ -60,8 +56,7 @@ def load_model() -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
 
     # Define the quantization configuration for 8-bit
     quantization_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
+        load_in_4bit=True,
     )
 
     # Load model

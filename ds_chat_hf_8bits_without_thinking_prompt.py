@@ -122,7 +122,7 @@ def generate_chat_response(
         logits = model(**inputs).logits
         outputs = model.generate(
             **inputs,
-            max_length=max_length,
+            max_length=max_length,  # max no of tokens
             do_sample=True,  # have multi-options (tokens) picks 1 based on prob.
             temperature=temperature,
             top_k=top_k,
