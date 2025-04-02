@@ -33,5 +33,9 @@ docs/
 main_chat.py
 test_chat_with_pipeline.py
 
+# Unrelated files to ignore
+testing_find_git.py
+
 # Folders not to be share
 sandbox/
+documents/

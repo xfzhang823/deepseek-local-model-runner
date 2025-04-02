@@ -1,0 +1,14 @@
+README.md
+setup.py
+chats/__init__.py
+chats/ds_chat_hf_4bits_with_thinking_prompt.py
+chats/ds_chat_hf_8bits_pipe_2.py
+chats/ds_chat_hf_8bits_pipe_v1.py
+chats/ds_chat_hf_8bits_with_thinking_prompt.py
+chats/ds_chat_hf_8bits_without_thinking_prompt.py
+chats/ds_chat_mixed_precision_no_quant_with_pipe.py
+my_llm_tool.egg-info/PKG-INFO
+my_llm_tool.egg-info/SOURCES.txt
+my_llm_tool.egg-info/dependency_links.txt
+my_llm_tool.egg-info/requires.txt
+my_llm_tool.egg-info/top_level.txt

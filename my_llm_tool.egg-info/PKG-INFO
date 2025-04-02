@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: my_llm_tool
+Version: 0.1
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: python-dotenv
+Requires-Dist: bitsandbytes
+Dynamic: requires-dist

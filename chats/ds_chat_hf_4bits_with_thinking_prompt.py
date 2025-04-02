@@ -1,13 +1,13 @@
 """
-main_chat_wtih_native_code.py
+ds_chat_hf_4bits_with_thinking_prompt.py
 
-This module loads a local causal language model, generates responses based on user input, 
-and logs the thinking process along with the final answer. 
+This module loads a local causal language model, generates responses based on user input,
+and logs the thinking process along with the final answer.
 
-The model is loaded with quantization settings to optimize memory usage and performance 
+The model is loaded with quantization settings to optimize memory usage and performance
 (32 bits -> 8 bits).
 
-The orchestration of the process is handled by the main function, and individual steps are 
+The orchestration of the process is handled by the main function, and individual steps are
 broken down into dedicated functions.
 """
 
@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from typing import Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 import logging_config
 
 # Setup logging
@@ -114,6 +115,8 @@ def generate_chat_response(
     Please reason through the problem step by step without repeating yourself. \
 Each step should be concise and progress logically toward the final answer:
     """
+
+    logger.debug(f"Prompt w/t Thinking: {thinking_prompt}")  # todo: debug; delete later
 
     # Tokenize the input prompt
     inputs = tokenizer(thinking_prompt, return_tensors="pt")
