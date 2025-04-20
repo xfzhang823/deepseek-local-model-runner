@@ -1,41 +1,47 @@
-# Ignore operating system files
+# ─── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.pyo
+
+# ─── Virtual Environments ─────────────────────────────────
+.venv/
+env/
+venv/
+
+# ─── Jupyter ───────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── Logs ──────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Transformers & HF Caches ─────────────────────────────
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# ─── GGUF / LLaMA.cpp Files ───────────────────────────────
+*.gguf
+*.ggml
+
+# ─── Checkpoints / Outputs ────────────────────────────────
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# ─── Model Directories (optional) ─────────────────────────
+models/
+# comment out if you store configs/scripts here
+
+# ─── VS Code ──────────────────────────────────────────────
+.vscode/
+
+# ─── OS / Editor Artifacts ────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Ignore IDE files
-.vscode/
-
-# Ignore environment variables file and folder
-.env
-env/
-
-# Ignore build and compilation files
-build/
-dist/
-target/
-node_modules/
-
-# Ignore log files
-*.log
-
-# Ignore configuration files
-.config/
-
-# Ignore binary files
-*.exe
-*.dll
-*.zip
-
 # Ignore documentation files
 docs/
-
-# Unfinished files to ignore
-main_chat.py
-test_chat_with_pipeline.py
-
-# Unrelated files to ignore
-testing_find_git.py
-
-# Folders not to be share
-sandbox/
-documents/
