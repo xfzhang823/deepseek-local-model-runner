@@ -1,3 +1,8 @@
+"""
+/loaders/hf_loader.py
+
+"""
+
 import os
 import time
 import logging
@@ -36,7 +41,7 @@ class HF_ModelLoader:
             start = time.time()
 
             load_dotenv()
-            model_name = os.getenv("MODEL_NAME")
+            model_name = os.getenv("MODEL_NAME_HF")
 
             if not model_name:
                 raise EnvironmentError(

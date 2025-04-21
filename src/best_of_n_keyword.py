@@ -3,7 +3,7 @@ from typing import List
 import logging
 
 from key_word_extractor import KeywordExtractor
-from model_loader import ModelLoader
+from loaders.hf_loader import HF_ModelLoader
 from llm_response_models import KeywordExtractionResponse
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def best_of_n_keyword_extraction(
     Returns:
         List[KeywordExtractionResponse]: Best result per input text.
     """
-    tokenizer, model = ModelLoader.load_model()
+    tokenizer, model = HF_ModelLoader.load_model()
     extractor = KeywordExtractor(model=model, tokenizer=tokenizer)
 
     def extract_with_retries(text: str) -> KeywordExtractionResponse:

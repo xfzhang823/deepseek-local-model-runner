@@ -17,6 +17,6 @@ model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 print(f"📥 Downloading model: {model_name}")
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name, use_auth_token=token)
+model = AutoModelForCausalLM.from_pretrained(model_name, token=token)
 
 print("✅ Model and tokenizer downloaded successfully!")
