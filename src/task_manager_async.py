@@ -3,12 +3,23 @@ task_manager_async.py
 
 * Async versions of the existing LLM task functions.
 
-Uses a simple decorator to convert blocking sync functions into async callables
-via `asyncio.get_running_loop().run_in_executor'.
+Each function in this module wraps a blocking task implementation
+(from `_sync_tasks.py`) using `asyncio.run_in_executor` to allow
+non-blocking concurrency with `async def` entrypoints.
+
+The signatures accept dynamic **kwargs so they can be invoked directly
+from a schema-based router (`TaskRequestModel`). These kwargs are passed
+along to the underlying sync implementations such as `summarize(...)`,
+`translate(...)`, etc.
+
+Usage:
+    await summarize_async(model="hf", mode="balanced", text="...")
 """
 
 import asyncio
 import logging
+from typing import Any, Awaitable, Callable, TypeVar
+from functools import partial, wraps
 from llm_response_models import (
     SummarizationResponse,
     TranslationResponse,
@@ -16,10 +27,6 @@ from llm_response_models import (
     TopicGenerationResponse,
     TextAlignmentResponse,
 )
-from project_config import get_config
-from loaders.dispatch_loader import get_model_loader  # loads tokenizer & model
-
-# Import blocking implementations from the sync task module
 from _sync_tasks import (
     summarize as _summarize_sync,
     translate as _translate_sync,
@@ -30,121 +37,98 @@ from _sync_tasks import (
 
 logger = logging.getLogger(__name__)
 
+# Import blocking implementations from the sync task module
+T = TypeVar("T")
 
-def sync_to_async(fn):
+
+def sync_to_async(fn: Callable[..., T]) -> Callable[..., Awaitable[T]]:
     """
     Decorator: wraps a blocking function so it can be awaited in asyncio.
+
+    All args and kwargs are captured via functools.partial and executed
+    in the event loop's default executor (threadpool).
     """
 
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args: Any, **kwargs: Any) -> T:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, fn, *args, **kwargs)
+        task = partial(fn, *args, **kwargs)
+
+        logger.info(
+            f"[Async] Executing {fn.__name__} in executor with args={args} kwargs={kwargs}"
+        )
+
+        try:
+            return await loop.run_in_executor(None, task)
+        except Exception as e:
+            logger.exception(f"[Async] Exception in {fn.__name__}: {e}")
+            raise
 
     return wrapper
 
 
 @sync_to_async
-async def summarize_async(text: str, mode: str = "balanced") -> SummarizationResponse:
+def summarize_async(**kwargs) -> SummarizationResponse:
     """
-    Async summarization: maps directly to the sync `summarize` function.
+    Asynchronously summarize text using the sync summarization backend.
+    Expected kwargs:
+        - text (str)
+        - mode (str)
+        - model (str)
     """
-    return _summarize_sync(text, mode)
+    logger.debug("[Async] Running summarize_async...")
+    return _summarize_sync(**kwargs)
 
 
 @sync_to_async
-async def translate_async(
-    text: str, target_lang: str = "French", mode: str = "balanced"
-) -> TranslationResponse:
+def translate_async(**kwargs) -> TranslationResponse:
     """
-    Async translation: maps directly to the sync `translate` function.
+    Asynchronously translate text using the sync translation backend.
+    Expected kwargs:
+        - text (str)
+        - target_lang (str)
+        - mode (str)
+        - model (str)
     """
-    return _translate_sync(text, target_lang, mode)
+    logger.debug("[Async] Running translate_async...")
+    return _translate_sync(**kwargs)
 
 
 @sync_to_async
-async def extract_keywords_async(
-    text: str, mode: str = "balanced"
-) -> KeywordExtractionResponse:
+def extract_keywords_async(**kwargs) -> KeywordExtractionResponse:
     """
-    Async keyword extraction: maps directly to the sync `extract_keywords` function.
+    Asynchronously extract keywords using the sync keyword extraction backend.
+    Expected kwargs:
+        - text (str)
+        - mode (str)
+        - model (str)
+        - prompt_type (str)
     """
-    return _extract_keywords_sync(text, mode)
+    logger.debug("[Async] Running extract_keywords_async...")
+    return _extract_keywords_sync(**kwargs)
 
 
 @sync_to_async
-async def generate_topics_async(text: str) -> TopicGenerationResponse:
+def generate_topics_async(**kwargs) -> TopicGenerationResponse:
     """
-    Async topic generation: maps directly to the sync `generate_topics` function.
+    Asynchronously generate topics using the sync backend.
+    Expected kwargs:
+        - text (str)
+        - model (str)
+        - mode (str)
     """
-    return _generate_topics_sync(text)
+    logger.debug("[Async] Running generate_topics_async...")
+    return _generate_topics_sync(**kwargs)
 
 
 @sync_to_async
-async def align_texts_async(
-    source_text: str, target_text: str
-) -> TextAlignmentResponse:
+def align_texts_async(**kwargs) -> TextAlignmentResponse:
     """
-    Async text alignment: maps directly to the sync `align_texts` function.
+    Asynchronously align text pairs using the sync backend.
+    Expected kwargs:
+        - source_text (str)
+        - target_text (str)
+        - model (str)
+        - mode (str)
     """
-    return _align_texts_sync(source_text, target_text)
-
-
-logger = logging.getLogger(__name__)
-
-
-def sync_to_async(fn):
-    """
-    Decorator: wraps a blocking function so it can be awaited in asyncio.
-    """
-
-    async def wrapper(*args, **kwargs):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, fn, *args, **kwargs)
-
-    return wrapper
-
-
-@sync_to_async
-async def summarize_async(text: str, mode: str = "balanced") -> SummarizationResponse:
-    """
-    Async summarization: maps directly to the sync `summarize` function.
-    """
-    return _summarize_sync(text, mode)
-
-
-@sync_to_async
-async def translate_async(
-    text: str, target_lang: str = "French", mode: str = "balanced"
-) -> TranslationResponse:
-    """
-    Async translation: maps directly to the sync `translate` function.
-    """
-    return _translate_sync(text, target_lang, mode)
-
-
-@sync_to_async
-async def extract_keywords_async(
-    text: str, mode: str = "balanced"
-) -> KeywordExtractionResponse:
-    """
-    Async keyword extraction: maps directly to the sync `extract_keywords` function.
-    """
-    return _extract_keywords_sync(text, mode)
-
-
-@sync_to_async
-async def generate_topics_async(text: str) -> TopicGenerationResponse:
-    """
-    Async topic generation: maps directly to the sync `generate_topics` function.
-    """
-    return _generate_topics_sync(text)
-
-
-@sync_to_async
-async def align_texts_async(
-    source_text: str, target_text: str
-) -> TextAlignmentResponse:
-    """
-    Async text alignment: maps directly to the sync `align_texts` function.
-    """
-    return _align_texts_sync(source_text, target_text)
+    logger.debug("[Async] Running align_texts_async...")
+    return _align_texts_sync(**kwargs)

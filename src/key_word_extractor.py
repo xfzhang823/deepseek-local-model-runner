@@ -7,9 +7,9 @@ import time
 from typing import List, Optional
 import torch
 from llm_response_models import KeywordExtractionResponse
-from prompt_templates import get_keyword_prompt
-from project_config import KEYWORD_EXTRACTION_PRESETS as PRESETS
-from project_config import KeywordExtractionConfig
+from prompts.keyword_extraction_prompts import get_keyword_prompt
+from schemas.generation_config import KEYWORD_EXTRACTION_PRESETS as PRESETS
+from schemas.generation_config import KeywordExtractionConfig
 
 logger = logging.getLogger(__name__)
 

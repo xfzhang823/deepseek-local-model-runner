@@ -11,7 +11,8 @@ from dotenv import load_dotenv
 load_dotenv()
 token = os.getenv("HUGGING_FACE_TOKEN")
 
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+model_name = "casperhansen/deepseek-r1-distill-qwen-1.5b-awq"
+# model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 # model_name = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
 
 print(f"📥 Downloading model: {model_name}")

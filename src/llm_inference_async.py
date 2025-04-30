@@ -19,7 +19,7 @@ integrate LLM inference into `asyncio` workflows without blocking the event loop
 """
 
 import asyncio
-from src._sync_tasks import generate, generate_with_thinking
+from _sync_tasks import generate, generate_with_thinking
 
 
 async def llm_call_async(*args, **kwargs):

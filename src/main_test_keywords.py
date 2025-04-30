@@ -1,6 +1,6 @@
 import logging
-from task_router import run_llm_task
-from api import translate_batch
+from task_router_async import run_llm_task_async
+from api_async import translate_batch_async
 from llm_response_models import (
     SummarizationResponse,
     TranslationResponse,
