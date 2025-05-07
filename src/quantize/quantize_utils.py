@@ -1,11 +1,84 @@
 """quantize_utils.py"""
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple, Union
 import torch
 import torch.nn as nn
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+ScaleEntry = Union[
+    Tuple[str, torch.Tensor],
+    Tuple[str, Union[Tuple[str, ...], List[str]], torch.Tensor],
+]
+
+
+def flatten_scales_or_clip_list(
+    scales_or_clip_list: List[ScaleEntry],
+) -> List[Tuple[str, torch.Tensor]]:
+    """
+    Flattens a list of scale tuples into a format compatible with `dict()`.
+
+    Args:
+        scales_list: A list of tuples representing scale mappings. Each item is either:
+            - A 2-tuple: (layer_name: str, scale: Tensor)
+            - A 3-tuple: (prefix: str, subnames: Tuple[str] or List[str], scale: Tensor)
+
+    Returns:
+        A flat list of 2-tuples: List[(str, Tensor)], where each key is a dot-prefixed name
+        like "prefix.subname".
+
+    Raises:
+        ValueError: If any entry is malformed or not a tuple of expected length.
+    """
+    if not isinstance(scales_or_clip_list, list):
+        raise TypeError(
+            f"Expected a list of tuples, got {type(scales_list)}: {scales_list}"
+        )
+    flattened: List[Tuple[str, torch.Tensor]] = []
+
+    for entry in scales_or_clip_list:
+        if not isinstance(entry, tuple):
+            raise ValueError(f"scales_list should contain only tuples: {entry}")
+
+        if len(entry) == 2:
+            key, tensor = entry
+            if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"Invalid 2-tuple entry: {entry}")
+            flattened.append((key, tensor))
+
+        elif len(entry) == 3:
+            prefix, subkeys, tensor = entry
+            if not isinstance(prefix, str) or not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"Invalid 3-tuple entry: {entry}")
+            if not isinstance(subkeys, (tuple, list)):
+                raise ValueError(f"Expected list or tuple for subkeys in: {entry}")
+
+            for name in subkeys:
+                if not isinstance(name, str):
+                    raise ValueError(f"Subkey must be a string in: {entry}")
+                full_key = f"{prefix}.{name}"
+                flattened.append((full_key, tensor))
+
+        else:
+            raise ValueError(f"Invalid scales_list entry length: {entry}")
+
+    return flattened
+
+
+def get_safe_parallel_sample_count() -> int:
+    """
+    Get the SAFE no. of parallel sample, given the device's vram.
+    If you flood the memory, the process will be VERY slow.
+    """
+    total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if total_mem < 6:
+        return 4
+    elif total_mem < 10:
+        return 8
+    else:
+        return 16
 
 
 def safe_update(
@@ -64,6 +137,8 @@ def safe_update(
 
 def unwrap_to_transformer(model: nn.Module) -> nn.Module:
     """
+    Utils function to extract models from wrappers (common structure among LLMs).
+
     Traverse model wrappers to find the true transformer (e.g., Qwen2Model).
 
     Handles:
@@ -84,3 +159,63 @@ def unwrap_to_transformer(model: nn.Module) -> nn.Module:
         raise AttributeError(
             "Could not unwrap model to transformer. Unexpected structure."
         )
+
+
+def inspect_calib_stats(path: str):
+    """
+    Inspect and validate a saved calibration stats file.
+
+    This will:
+    - Load the file
+    - Print type and structure of 'scales' and 'clips'
+    - Preview several entries if they exist
+    - Warn if anything looks inconsistent
+
+    Example:
+        >>> inspect_calib_stats("/path/to/calib_stats.pt")
+    """
+    print(f"\n📂 Inspecting: {path}", flush=True)
+
+    data = torch.load(path, map_location="cpu")
+
+    # Force dict casting for safety
+    raw_scales = data.get("scales", {})
+    raw_clips = data.get("clips", {})
+
+    scales = dict(raw_scales or {})  # fallback to empty
+    clips = dict(raw_clips or {})
+
+    print(
+        f"🔍 type(scales): {type(raw_scales)}, len: {len(scales)}, keys: {list(scales.keys())[:3]}",
+        flush=True,
+    )
+    print(
+        f"🔍 type(clips): {type(raw_clips)}, len: {len(clips)}, keys: {list(clips.keys())[:3]}",
+        flush=True,
+    )
+
+    if len(scales) == 0:
+        print(
+            "⚠️ WARNING: 'scales' is empty — calibration may have failed or file is partial.",
+            flush=True,
+        )
+
+    if len(scales) > 0:
+        print("\n📏 Scales preview:")
+        for k, v in list(scales.items())[:5]:
+            print(
+                f" - {k}: shape={tuple(v.shape)}, mean={v.mean():.4f}, std={v.std():.4f}"
+            )
+        if len(scales) > 5:
+            print("   ...")
+
+    if len(clips) > 0:
+        print("\n✂️ Clips preview:")
+        for k, v in list(clips.items())[:5]:
+            print(
+                f" - {k}: shape={tuple(v.shape)}, mean={v.mean():.4f}, std={v.std():.4f}"
+            )
+        if len(clips) > 5:
+            print("   ...")
+
+    print("")  # trailing newline for readability

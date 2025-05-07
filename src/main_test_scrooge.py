@@ -28,9 +28,7 @@ logger = logging.getLogger(__name__)
 def main():
     # Define your input model path and save path
     model_path = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR)
-    save_path = str(
-        DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR / "calibration_stats.pt"
-    )
+    save_path = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR)
 
     # Run quantization pipeline
     scrooge_quant_pipeline(
@@ -40,7 +38,7 @@ def main():
         apply_clip=True,
     )
 
-    logger.info("✅ Quantization calibration completed successfully.")
+    logger.info("✅ Quantization pipeline completed successfully.")
 
 
 if __name__ == "__main__":

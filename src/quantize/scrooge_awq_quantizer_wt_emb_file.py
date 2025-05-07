@@ -1,4 +1,7 @@
 """
+todo: currently not working b/c the embedding files saved didn't have
+todo: the embedding vs rotary embedding info!
+
 Custom AWQ Quantizer (src/scrooge_awq_quantizer.py)
 Splits calibration and quantization phases cleanly.
 

@@ -1,4 +1,4 @@
-"""src/import_paths.py"""
+"""import_paths.py"""
 
 import sys
 from pathlib import Path

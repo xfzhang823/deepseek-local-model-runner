@@ -1,11 +1,5 @@
-from transformers import Qwen2ForCausalLM
+from quantize.quantize_utils import inspect_calib_stats
 
-model = Qwen2ForCausalLM.from_pretrained("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+file_path = "/home/xzhang/models/deepseek-awq-scrooge/calib_stats.pt"
 
-print(model.__class__)
-# Qwen2ForCausalLM
-
-print(model.model.__class__)
-# Qwen2Model
-
-# print(model.model.model.__class__)
+inspect_calib_stats(file_path)

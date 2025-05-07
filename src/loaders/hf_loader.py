@@ -6,7 +6,7 @@
 import os
 import time
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from dotenv import load_dotenv
@@ -23,8 +23,8 @@ class HF_ModelLoader:
 
     # class-level variable _models, and they will eventually hold a Hugging Face language
     # model, but are currently unset (None)
-    _model: AutoModelForCausalLM = None
-    _tokenizer: AutoTokenizer = None
+    _model: Optional[AutoModelForCausalLM] = None
+    _tokenizer: Optional[AutoTokenizer] = None
 
     @classmethod
     def load_model(cls) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
