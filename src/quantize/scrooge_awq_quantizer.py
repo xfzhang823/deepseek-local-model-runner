@@ -305,7 +305,16 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             or quantized.
         """
         transformer = unwrap_to_transformer(model)
-        return transformer.layers
+
+        logger.debug(f"Model structure after unwrap: {type(transformer)}")
+        layers = getattr(transformer, "layers", None)
+
+        if layers is None:
+            logger.warning("No layers found in the model structure.")
+            return []
+
+        logger.info(f"Total layers identified: {len(layers)}")
+        return layers
 
     @staticmethod
     def move_embed(model: nn.Module, device: Any) -> None:
@@ -794,7 +803,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 module, input_feat, self.module_kwargs
             )
 
-            # Run scale search
+            # * ✅ Iterate to run actual search for scale!
             scales_list = []
             for j, layer in enumerate(module_config):
                 layer_name = layer.get("name", f"Layer_{j}")
@@ -825,8 +834,45 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 logger.info(f"🧪 Start _search_best_scale on module {i}, layer {j}")
                 start_scale = time.time()
 
-                scale = self._search_best_scale(module, **layer)
-                scales_list.append(scale)  # * ☑️ append scale to scale_list
+                # * Search for scale
+                # ☑️ Returned format: ("name", ("subname1", "subname2"), tensor)
+                # i.e., ("post_attention_layernorm", ("mlp.gate_proj", "mlp.up_proj"), tensor([...]))
+                scale_data = self._search_best_scale(module, **layer)
+
+                # Log the returned scale data
+                logger.debug(
+                    f"Scale data received from _search_best_scale: {scale_data} (type: {type(scale_data)})"
+                )
+
+                # Fallback handling for None
+                if scale_data is None:
+                    logger.warning(
+                        f"Scale data is None for layer {layer_name}. Skipping."
+                    )
+                    continue
+
+                # Directly create ScaleEntry without unpacking
+                # ☑️ ScaleEntry(
+                #       name="post_attention_layernorm",
+                #       subnames=["mlp.gate_proj", "mlp.up_proj"],
+                #       value=tensor([...])
+                #     )
+                # ☑️ scales_list = [
+                #       ScaleEntry(name="input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
+                #       ScaleEntry(name="post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
+                #       ScaleEntry(name="mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
+                #     ]
+                if isinstance(scale_data, tuple) and len(scale_data) == 3:
+                    scales_list.append(
+                        ScaleEntry(
+                            name=scale_data[0],
+                            subnames=list(scale_data[1]),
+                            value=scale_data[2],
+                        )
+                    )
+                else:
+                    logger.warning(f"Unexpected scale data structure: {scale_data}")
+                    continue
 
                 elapsed_scale = time.time() - start_scale
                 logger.info(
@@ -834,9 +880,31 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 )  # logging time
 
             try:
-                scales_list = flatten_scales_or_clip_list(scales_list)
+                # ☑️ Add prefix -> this format:
+                # [
+                #   ScaleEntry(name="model.model.layers.0.input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
+                #   ScaleEntry(name="model.model.layers.0.post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
+                #   ScaleEntry(name="model.model.layers.0.mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
+                # ]
+                scales_list = append_str_prefix(
+                    scales_list, get_op_name(self.model, self.modules[i]) + "."
+                )
+
+                # ☑️ flatten nested before saving -> expected format (in tuples already):
+                # ("model.model.layers.0.input_layernorm.self_attn.q_proj", tensor([...]))
+                # ("model.model.layers.0.input_layernorm.self_attn.k_proj", tensor([...]))
+                # ("model.model.layers.0.input_layernorm.self_attn.v_proj", tensor([...]))
+                flattened = flatten_scales_or_clip_list(
+                    cast(List[ScaleEntry], scales_list)
+                )
+                logger.debug(f"Flattened structure: {flattened}")
+                logger.debug(f"First entry type: {type(flattened[0])}")
+
+                # Extra validation and deduping
                 start_scale = time.time()
-                safe_update(all_scales, scales_list, name="scales", strict=True)
+                safe_update(
+                    all_scales, flattened, name="scales", strict=True
+                )  # Enforce strict mode
             except Exception as e:
                 logger.error(f"❌ [calibrate] Failed during scale update: {e}")
                 raise
@@ -867,8 +935,12 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     )
                     flattened = flatten_scales_or_clip_list(
                         cast(List[ScaleEntry], clip_list)
-                    )
-                    safe_update(all_clips, flattened, name="clips", strict=True)
+                    )  # * flatten nested before saving
+
+                    # Extra validation and deduping
+                    safe_update(
+                        all_clips, flattened, name="clips", strict=True
+                    )  # Enforce strict mode
                 except Exception as e:
                     logger.error(f"❌ [calibrate] Failed during clip update: {e}")
                     raise
@@ -1030,10 +1102,22 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         Steps:
             1. Validates calibration scales are available.
-            2. Iterates through all modules in the model.
-            3. Applies quantization to each Linear layer based on the calibration scales.
+            2. Get named layers [Block1, Block2, ..., Block24]
+            3. Iterates through all modules in the model (get_linear) and
+            Applies quantization to each Linear layer based on the calibration scales.
             4. Logs timing and status for each layer.
 
+            * Note:
+            * get_linear outputs grabs Lower-Level Extraction of Linear Layers:
+                {
+                "self_attn.q_proj": LinearLayer1,
+                "self_attn.k_proj": LinearLayer2,
+                "self_attn.v_proj": LinearLayer3,
+                "self_attn.o_proj": LinearLayer4,
+                "mlp.gate_proj": LinearLayer5,
+                "mlp.up_proj": LinearLayer6,
+                "mlp.down_proj": LinearLayer7,
+                }
         Raises:
             RuntimeError: If `self.modules` is not set.
             ValueError: If calibration scales (`self.all_scales`) are not loaded.
@@ -1054,18 +1138,20 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         layer_times = {}
         skipped_count = 0
 
-        # Step 0: Check & validate
+        # Step 1: Check & validate
+        # Check layer
         if not self.modules:
-            raise RuntimeError(
-                "Quantizer modules not set. Call get_model_layers(model) first."
-            )
+            logger.info("Modules not initialized. Fetching model layers...")
+            self.modules = self.get_model_layers(self.model)
+            logger.info(f"Modules initialized. Total layers: {len(self.modules)}")
 
+        # Check scales loaded properly
         if not hasattr(self, "all_scales") or not self.all_scales:
             raise ValueError(
                 "❌ `self.all_scales` is not populated. Run calibration first."
             )
 
-        # Step 1: Iterate over modules and apply quantization
+        # Step 2: Iterate over modules and apply quantization
         for module in self.modules:
             named_linears = get_named_linears(module)
 
@@ -1118,7 +1204,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 layer_times[op_name] = elapsed_time
                 logger.info(f"⏱️ Quantized {op_name} in {elapsed_time:.4f} seconds.")
 
-        # Overall timing
+        # Step 3: Overall timing
         total_time = time.time() - start_time
         logger.info(f"✅ Quantization completed in {total_time:.4f} seconds.")
 
@@ -1141,12 +1227,13 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         shard_size: str = "5GB",
     ) -> None:
         """
-        Save quantized model and its configuration, including related files such as processor, configuration,
-        and quantized weights.
+        Save quantized model and its configuration, including related files such as processor,
+        configuration, and quantized weights.
 
         Args:
             save_dir (str): Directory to save the model.
-            safetensors (bool): Whether to use safetensors format (`.safetensors`), otherwise `.bin`.
+            safetensors (bool): Whether to use safetensors format (`.safetensors`),
+                otherwise `.bin`.
             shard_size (str): Maximum shard size for large models.
 
         Example:

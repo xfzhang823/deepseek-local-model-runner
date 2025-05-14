@@ -1,6 +1,6 @@
 """quantize_utils.py"""
 
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union, Optional
 import torch
 import torch.nn as nn
 import logging
@@ -8,10 +8,48 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-ScaleEntry = Union[
-    Tuple[str, torch.Tensor],
-    Tuple[str, Union[Tuple[str, ...], List[str]], torch.Tensor],
-]
+class ScaleEntry:
+    """
+    A container class for storing named scaling factors with associated metadata.
+
+    This class is designed to hold scaling parameters (typically as PyTorch tensors)
+    along with their identifiers and optional sub-identifiers. Useful for managing
+    normalization parameters, feature scaling factors, or other transformation parameters
+    in machine learning pipelines.
+
+    Attributes:
+        name (str): Primary identifier for the scaling factor.
+        value (torch.Tensor): The scaling parameter values stored as a PyTorch tensor.
+        subnames (List[str]): Optional list of sub-identifiers, typically used when the
+            scaling factor applies to multiple features or dimensions.
+
+    Example:
+        >>> # Creating a scale entry for image normalization
+        >>> mean_scale = ScaleEntry(
+        ...     name="image_normalization",
+        ...     value=torch.tensor([0.485, 0.456, 0.406]),  # ImageNet mean
+        ...     subnames=["red", "green", "blue"]
+        ... )
+        >>> print(mean_scale)
+        ScaleEntry(name=image_normalization, subnames=['red', 'green', 'blue'], value_shape=torch.Size([3]))
+    """
+
+    def __init__(
+        self, name: str, value: torch.Tensor, subnames: Optional[List[str]] = None
+    ):
+        """Initializes the ScaleEntry with name, value, and optional subnames.
+
+        Args:
+            name: Primary identifier for the scaling factor.
+            value: The scaling parameter values as a PyTorch tensor.
+            subnames: Optional list of sub-identifiers. If None, defaults to empty list.
+        """
+        self.name = name
+        self.subnames = subnames or []
+        self.value = value
+
+    def __repr__(self):
+        return f"ScaleEntry(name={self.name}, subnames={self.subnames}, value_shape={self.value.shape})"
 
 
 def flatten_scales_or_clip_list(
