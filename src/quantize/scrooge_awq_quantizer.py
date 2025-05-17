@@ -180,8 +180,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.inps: Optional[torch.Tensor] = None
 
         # ✅ Calibration results
-        self.all_scales: Optional[Dict[str, torch.Tensor]] = None
-        self.all_clips: Optional[Dict[str, torch.Tensor]] = None
+        self.all_scales: List[Tuple[str, torch.Tensor]] = []
+        self.all_clips: List[Tuple[str, torch.Tensor]] = []
 
         # ✅ Calibration dataset
         self.calib_data = None
@@ -198,6 +198,14 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.duo_scaling = False
         self.zero_point = False  # Set to symmetric
         self.w_bit: int = 4
+
+    def log_vram_usage(self, tag: str):
+        """Log vram utilization"""
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        logger.info(
+            f"[{tag}] VRAM - Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB"
+        )
 
     @staticmethod
     def get_layers_for_scaling(
@@ -715,12 +723,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         start_time = time.time()
         logger.info("🚀 [calibrate] Starting AWQ calibration...")
 
-        # Move model embedding layers to GPU and unwrap
+        # Move model embedding layers to GPU
         device = get_best_device()
-
-        # if hasattr(self.model, "model"):
-        #     logger.info("🔍 [calibrate] Unwrapping nested model (self.model.model).")
-        #     self.model = self.model.model
 
         # ✅ Don't unwrap!
         logger.info(
@@ -755,6 +759,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 "✅ [calibrate] Model structure validated — using self.model.model.model.layers"
             )
 
+        # * Generate calibration inputs
+
         # Step 1: Generate calibration inputs via init_quant
         try:
             self.modules, self.module_kwargs, self.inps = self.init_quant(
@@ -766,18 +772,20 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.error(f"❌ [calibrate] Failed during init_quant(): {e}")
             raise
 
-        all_scales: Dict[str, torch.Tensor] = {}
-        all_clips: Dict[str, torch.Tensor] = {}
+        all_scales: List[Tuple[str, torch.Tensor]] = []
+        all_clips: List[Tuple[str, torch.Tensor]] = []
 
         assert self.modules is not None, "self.modules must be set before calibration"
 
-        # Step 2: Per-module calibration
+        # Step 2: Iterate over each module
+        # * 🔁 Outer Loop
         for i, module in enumerate(self.modules):
             logger.info(f"🔍 [calibrate] Processing module {i}/{len(self.modules)}")
+
             module = module.to(device)
             self.modules[i] = module
 
-            # Get input features by running hooks
+            # Get input features
             named_linears = get_named_linears(module)
             named_linears = exclude_layers_to_not_quantize(
                 named_linears, self.modules_to_not_convert
@@ -798,45 +806,32 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     f"[Flat v_proj activation] Layer {i}, std={input_feat["self_attn.v_proj"].std:.6f}"
                 )
 
+            # Collect scale & clip data for the module
+            module_scales = []
+            module_clips = []
+
+            # * ✅ Iterate to run actual search for scale!
             # Get config from model for what to calibrate
             module_config = self.model.get_layers_for_scaling(
                 module, input_feat, self.module_kwargs
             )
 
-            # * ✅ Iterate to run actual search for scale!
-            scales_list = []
+            # Process each layer for scales
+            # * 🔁 Inner Loop
             for j, layer in enumerate(module_config):
+
+                # Logging
                 layer_name = layer.get("name", f"Layer_{j}")
                 logger.info(
                     f"  🔹 [calibrate] Module {i}/{len(self.modules)} — Layer {j}/{len(module_config)}: {layer_name}"
                 )
-
-                # Skip if no sublayers
-                if not layer.get("layers"):
-                    logger.warning(f"⚠️ Skipping {layer_name} — no sublayers found.")
-                    continue
-
-                valid_weights = [
-                    l.weight
-                    for l in layer["layers"]
-                    if hasattr(l, "weight")
-                    and l.weight is not None
-                    and l.weight.shape[0] > 0
-                ]
-
-                # 💥 Final guard: if torch.cat(valid_weights) would be empty
-                if sum(w.shape[0] for w in valid_weights) == 0:
-                    logger.warning(
-                        f"⚠️ Skipping {layer.get('name', 'unknown')} — concatenated weight would be empty."
-                    )
-                    continue
-
                 logger.info(f"🧪 Start _search_best_scale on module {i}, layer {j}")
+
                 start_scale = time.time()
 
                 # * Search for scale
                 # ☑️ Returned format: ("name", ("subname1", "subname2"), tensor)
-                # i.e., ("post_attention_layernorm", ("mlp.gate_proj", "mlp.up_proj"), tensor([...]))
+                # -> ("post_attention_layernorm", ("mlp.gate_proj", "mlp.up_proj"), tensor([...]))
                 scale_data = self._search_best_scale(module, **layer)
 
                 # Log the returned scale data
@@ -844,111 +839,92 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     f"Scale data received from _search_best_scale: {scale_data} (type: {type(scale_data)})"
                 )
 
-                # Fallback handling for None
-                if scale_data is None:
+                if scale_data is not None:
+                    # Append ScaleEntry to module_scales
+                    module_scales.append(scale_data)
+
+                    end_scale = time.time()
+                    logger.info(
+                        f"Scale search completed in {end_scale - start_scale:.2f} seconds"
+                    )
+
+                else:
                     logger.warning(
                         f"Scale data is None for layer {layer_name}. Skipping."
                     )
                     continue
 
-                # Directly create ScaleEntry without unpacking
-                # ☑️ ScaleEntry(
-                #       name="post_attention_layernorm",
-                #       subnames=["mlp.gate_proj", "mlp.up_proj"],
-                #       value=tensor([...])
-                #     )
-                # ☑️ scales_list = [
-                #       ScaleEntry(name="input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
-                #       ScaleEntry(name="post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
-                #       ScaleEntry(name="mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
-                #     ]
-                if isinstance(scale_data, tuple) and len(scale_data) == 3:
-                    scales_list.append(
-                        ScaleEntry(
-                            name=scale_data[0],
-                            subnames=list(scale_data[1]),
-                            value=scale_data[2],
-                        )
-                    )
-                else:
-                    logger.warning(f"Unexpected scale data structure: {scale_data}")
-                    continue
+            # Flatten data
+            flattened_scales = flatten_scales_or_clip_list(module_scales)
+            logger.debug(
+                f"Step 1 - Flattened scales format: {flattened_scales[:3]}"
+            )  # Show first 3 for quick inspection
 
-                elapsed_scale = time.time() - start_scale
-                logger.info(
-                    f"⏱️ [timing] Scale search took {elapsed_scale:.2f} seconds for module {i}, layer {j}"
-                )  # logging time
+            # and added prefix (layer path)
+            prefixed_scales = append_str_prefix(
+                flattened_scales, get_op_name(self.model, self.modules[i]) + "."
+            )
+            logger.debug(
+                f"Step 2 - Prefixed scales format: {prefixed_scales[:3]}"
+            )  # Show first 3 for quick inspection
 
-            try:
-                # ☑️ Add prefix -> this format:
-                # [
-                #   ScaleEntry(name="model.model.layers.0.input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
-                #   ScaleEntry(name="model.model.layers.0.post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
-                #   ScaleEntry(name="model.model.layers.0.mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
-                # ]
-                scales_list = append_str_prefix(
-                    scales_list, get_op_name(self.model, self.modules[i]) + "."
-                )
+            # Extend to all_scals
+            all_scales.extend(prefixed_scales)
+            logger.debug(
+                f"Step 3 - Updated all_scales length: {len(all_scales)} | Sample entries: {all_scales[-3:]}"
+            )  # Show last 3 entries added
 
-                # ☑️ flatten nested before saving -> expected format (in tuples already):
-                # ("model.model.layers.0.input_layernorm.self_attn.q_proj", tensor([...]))
-                # ("model.model.layers.0.input_layernorm.self_attn.k_proj", tensor([...]))
-                # ("model.model.layers.0.input_layernorm.self_attn.v_proj", tensor([...]))
-                flattened = flatten_scales_or_clip_list(
-                    cast(List[ScaleEntry], scales_list)
-                )
-                logger.debug(f"Flattened structure: {flattened}")
-                logger.debug(f"First entry type: {type(flattened[0])}")
+            logger.debug(
+                f"[Module {i}] Cumulative scales count so far: {len(all_scales)}"
+            )
 
-                # Extra validation and deduping
-                start_scale = time.time()
-                safe_update(
-                    all_scales, flattened, name="scales", strict=True
-                )  # Enforce strict mode
-            except Exception as e:
-                logger.error(f"❌ [calibrate] Failed during scale update: {e}")
-                raise
-
-            if "layers" in layer and isinstance(layer["layers"], list):
-                for l in layer["layers"]:
-                    if l.weight.shape[0] == 0:
-                        logger.warning(f"⚠️ Skipping sublayer {l} — zero-sized output.")
-                        continue
-
-            # Optional clipping (exclude outliers that would skew the scale)
+            # Optional clipping (Process clips per module)
+            # * clipping is @ the block level only!
             if self.apply_clip:
                 try:
-                    logger.info(f"🧪 Start _search_best_clip on module {i}")
-                    start_clip = time.time()
-
                     clip_list = self._search_best_clip(
                         module, named_linears, input_feat
                     )
-
-                    elapsed_clip = time.time() - start_clip
-                    logger.info(
-                        f"⏱️ [timing] Clip search took {elapsed_clip:.2f} seconds for module {i}"
-                    )  # loggging time
-
-                    clip_list = append_str_prefix(
-                        clip_list, get_op_name(self.model, module) + "."
-                    )
-                    flattened = flatten_scales_or_clip_list(
-                        cast(List[ScaleEntry], clip_list)
-                    )  # * flatten nested before saving
-
-                    # Extra validation and deduping
-                    safe_update(
-                        all_clips, flattened, name="clips", strict=True
-                    )  # Enforce strict mode
+                    module_clips.extend(clip_list)
                 except Exception as e:
-                    logger.error(f"❌ [calibrate] Failed during clip update: {e}")
-                    raise
+                    logger.error(f"❌ Failed during clip update for module {i}: {e}")
+
+            # Add prefix to clips
+            prefixed_clips = append_str_prefix(
+                module_clips, get_op_name(self.model, self.modules[i]) + "."
+            )
+            logger.debug(f"[Module {i}] Prefixed clips: {prefixed_clips[:3]}")
+
+            # Extend all_clips with current module_clips
+            all_clips.extend(prefixed_clips)
+            logger.debug(
+                f"[Module {i}] Cumulative clips count so far: {len(all_clips)}"
+            )
 
             # Free up memory
             self.modules[i] = module.cpu()
             clear_memory()
-            logger.info(f"🧹 [calibrate] Memory cleared after module {i}")
+
+        # Safe update with enhanced logging
+        try:
+            # Log sizes and sample entries for both scales and clips
+            logger.debug(f"Final scales count: {len(all_scales)}")
+            logger.debug(f"Final clips count: {len(all_clips)}")
+
+            # Display a few sample entries for verification
+            sample_scales = all_scales[:3] if len(all_scales) > 3 else all_scales
+            sample_clips = all_clips[:3] if len(all_clips) > 3 else all_clips
+
+            logger.debug(f"Sample scales entries: {sample_scales}")
+            logger.debug(f"Sample clips entries: {sample_clips}")
+
+            # Update the scales and clips lists
+            safe_update(self.all_scales, all_scales, name="scales", strict=False)
+            safe_update(self.all_clips, all_clips, name="clips", strict=True)
+
+        except Exception as e:
+            logger.error(f"❌ Failed during scale/clips update: {e}")
+            raise
 
         # Save calibration results
         if save_path:
@@ -960,9 +936,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             except Exception as e:
                 logger.error(f"❌ [calibrate] Failed to save stats: {e}")
                 raise
-
-        self.all_scales = all_scales
-        self.all_clips = all_clips
 
         if clear_inps:
             try:

@@ -42,6 +42,9 @@ if not torch.cuda.is_available():
 
 # Resolve paths and model name
 base = os.getenv("MODEL_NAME_HF")  # e.g., "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+if base is None:
+    raise ValueError("Base cannot be None")
+
 hf_token = os.getenv("HUGGING_FACE_TOKEN")
 out_dir = os.path.expanduser(os.getenv("AWQ_OUTPUT_DIR", "~/models/deepseek-awq"))
 
@@ -96,7 +99,13 @@ def load_wikitext():
 calib_data = load_wikitext()
 
 # Quantize on GPU
-quant_config = {"w_bit": 4, "q_group_size": 128, "zero_point": True, "version": "GEMM"}
+quant_config = {
+    "w_bit": 4,
+    "q_group_size": 128,
+    "zero_point": True,
+    "version": "GEMM",
+    "n_parallel_calib_samples": 4,
+}
 try:
     model.quantize(
         tokenizer,

@@ -53,56 +53,120 @@ class ScaleEntry:
 
 
 def flatten_scales_or_clip_list(
-    scales_or_clip_list: List[ScaleEntry],
+    scales_or_clip_list: List[
+        Union[ScaleEntry, Tuple[str, Union[Tuple[str], List[str]], torch.Tensor]]
+    ],
 ) -> List[Tuple[str, torch.Tensor]]:
     """
-    Flattens a list of scale tuples into a format compatible with `dict()`.
+    Flattens a list of scale tuples or ScaleEntry objects into a format compatible with `dict()`.
 
     Args:
-        scales_list: A list of tuples representing scale mappings. Each item is either:
-            - A 2-tuple: (layer_name: str, scale: Tensor)
-            - A 3-tuple: (prefix: str, subnames: Tuple[str] or List[str], scale: Tensor)
+        scales_or_clip_list: A list containing either ScaleEntry objects or tuples in
+        the following formats:
+            - 2-tuple: (layer_name: str, scale: Tensor)
+            - 3-tuple: (prefix: str, subnames: Tuple[str] or List[str], scale: Tensor)
 
     Returns:
         A flat list of 2-tuples: List[(str, Tensor)], where each key is a dot-prefixed name
         like "prefix.subname".
 
     Raises:
-        ValueError: If any entry is malformed or not a tuple of expected length.
+        ValueError: If any entry is malformed or of an unexpected type.
     """
-    if not isinstance(scales_or_clip_list, list):
-        raise TypeError(
-            f"Expected a list of tuples, got {type(scales_list)}: {scales_list}"
-        )
     flattened: List[Tuple[str, torch.Tensor]] = []
 
     for entry in scales_or_clip_list:
-        if not isinstance(entry, tuple):
-            raise ValueError(f"scales_list should contain only tuples: {entry}")
 
-        if len(entry) == 2:
-            key, tensor = entry
-            if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
-                raise ValueError(f"Invalid 2-tuple entry: {entry}")
-            flattened.append((key, tensor))
+        # Handle ScaleEntry objects directly
+        if isinstance(entry, ScaleEntry):
+            for subname in entry.subnames:
+                full_key = f"{entry.name}.{subname}"
+                flattened.append((full_key, entry.value))
+            if not entry.subnames:
+                flattened.append((entry.name, entry.value))
 
-        elif len(entry) == 3:
-            prefix, subkeys, tensor = entry
-            if not isinstance(prefix, str) or not isinstance(tensor, torch.Tensor):
-                raise ValueError(f"Invalid 3-tuple entry: {entry}")
-            if not isinstance(subkeys, (tuple, list)):
-                raise ValueError(f"Expected list or tuple for subkeys in: {entry}")
+        # Handle tuple structure
+        elif isinstance(entry, tuple):
+            if len(entry) == 2:
+                key, tensor = entry
+                if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
+                    raise ValueError(f"Invalid 2-tuple entry: {entry}")
+                flattened.append((key, tensor))
 
-            for name in subkeys:
-                if not isinstance(name, str):
-                    raise ValueError(f"Subkey must be a string in: {entry}")
-                full_key = f"{prefix}.{name}"
-                flattened.append((full_key, tensor))
+            elif len(entry) == 3:
+                prefix, subkeys, tensor = entry
+                if not isinstance(prefix, str) or not isinstance(tensor, torch.Tensor):
+                    raise ValueError(f"Invalid 3-tuple entry: {entry}")
+                if not isinstance(subkeys, (tuple, list)):
+                    raise ValueError(f"Expected list or tuple for subkeys in: {entry}")
+
+                for name in subkeys:
+                    if not isinstance(name, str):
+                        raise ValueError(f"Subkey must be a string in: {entry}")
+                    full_key = f"{prefix}.{name}"
+                    flattened.append((full_key, tensor))
+
+            else:
+                raise ValueError(f"Invalid entry length: {entry}")
 
         else:
-            raise ValueError(f"Invalid scales_list entry length: {entry}")
+            raise ValueError(f"Invalid entry type: {type(entry)} - {entry}")
 
     return flattened
+
+
+# Commented out: previous version
+# def flatten_scales_or_clip_list(
+#     scales_or_clip_list: List[ScaleEntry],
+# ) -> List[Tuple[str, torch.Tensor]]:
+#     """
+#     Flattens a list of scale tuples into a format compatible with `dict()`.
+
+#     Args:
+#         scales_list: A list of tuples representing scale mappings. Each item is either:
+#             - A 2-tuple: (layer_name: str, scale: Tensor)
+#             - A 3-tuple: (prefix: str, subnames: Tuple[str] or List[str], scale: Tensor)
+
+#     Returns:
+#         A flat list of 2-tuples: List[(str, Tensor)], where each key is a dot-prefixed name
+#         like "prefix.subname".
+
+#     Raises:
+#         ValueError: If any entry is malformed or not a tuple of expected length.
+#     """
+#     if not isinstance(scales_or_clip_list, list):
+#         raise TypeError(
+#             f"Expected a list of tuples, got {type(scales_list)}: {scales_list}"
+#         )
+#     flattened: List[Tuple[str, torch.Tensor]] = []
+
+#     for entry in scales_or_clip_list:
+#         if not isinstance(entry, tuple):
+#             raise ValueError(f"scales_list should contain only tuples: {entry}")
+
+#         if len(entry) == 2:
+#             key, tensor = entry
+#             if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
+#                 raise ValueError(f"Invalid 2-tuple entry: {entry}")
+#             flattened.append((key, tensor))
+
+#         elif len(entry) == 3:
+#             prefix, subkeys, tensor = entry
+#             if not isinstance(prefix, str) or not isinstance(tensor, torch.Tensor):
+#                 raise ValueError(f"Invalid 3-tuple entry: {entry}")
+#             if not isinstance(subkeys, (tuple, list)):
+#                 raise ValueError(f"Expected list or tuple for subkeys in: {entry}")
+
+#             for name in subkeys:
+#                 if not isinstance(name, str):
+#                     raise ValueError(f"Subkey must be a string in: {entry}")
+#                 full_key = f"{prefix}.{name}"
+#                 flattened.append((full_key, tensor))
+
+#         else:
+#             raise ValueError(f"Invalid scales_list entry length: {entry}")
+
+#     return flattened
 
 
 def get_safe_parallel_sample_count() -> int:
@@ -120,25 +184,25 @@ def get_safe_parallel_sample_count() -> int:
 
 
 def safe_update(
-    target_dict: Dict[str, torch.Tensor],
-    source: Any,
+    target_list: List[Tuple[str, torch.Tensor]] | None,
+    source: List[Tuple[str, torch.Tensor]],
     name: str = "scales",
     strict: bool = False,
 ) -> None:
     """
-    Safely updates a target dictionary from a source list of (str, Tensor) pairs.
+    Safely updates a target list with source list of (str, Tensor) pairs.
 
     Args:
-        - target_dict (Dict[str, torch.Tensor]): The dictionary to update.
-        - source (Any): The object expected to be a list of (str, Tensor) tuples.
-        - name (str, optional): Name for logging (e.g., "scales" or "clips").
-        Defaults to "scales".
-        - strict (bool, optional): Whether to raise an error if structure is invalid.
-        Defaults to False.
+        target_list (List[Tuple[str, torch.Tensor]]): The list to extend.
+        source (List[Tuple[str, torch.Tensor]]): The source list of tuples.
+        name (str, optional): Name for logging (e.g., "scales" or "clips").
+            Defaults to "scales".
+        strict (bool, optional): Whether to raise an error if structure is invalid.
+            Defaults to False.
 
     Raises:
-        TypeError: If strict=True and source is not a list.
-        ValueError: If strict=True and source cannot be converted to a dict.
+        TypeError: If strict=True and source is not a list of tuples.
+        ValueError: If strict=True and source cannot be extended.
     """
     if not isinstance(source, list):
         message = (
@@ -146,22 +210,32 @@ def safe_update(
         )
         if strict:
             logger.error(message)
-            raise TypeError(f"{name}_list must be a list after append_str_prefix().")
+            raise TypeError(f"{name}_list must be a list after processing.")
         else:
             logger.warning(message)
-            return  # Quietly skip update if not strict
+            return
 
     try:
-        source_dict = dict(source)
-        target_dict.update(source_dict)
+        # Ensure the structure is List[Tuple[str, Tensor]]
+        for entry in source:
+            if not (
+                isinstance(entry, tuple)
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], torch.Tensor)
+            ):
+                raise ValueError(f"Invalid entry in {name}_list: {entry}")
+
+        # Extend the target list
+        target_list.extend(source)
         logger.info(
-            f"✅ [calibrate] {name.capitalize()} updated successfully with {len(source_dict)} entries."
+            f"✅ [calibrate] {name.capitalize()} updated successfully with {len(source)} entries."
         )
+
     except Exception as e:
         message = f"❌ [calibrate] Failed to update {name} due to structure issue: {e}"
         if strict:
             logger.error(message)
-            logger.error(f"🔍 [calibrate] Problematic {name}_list sample: {source[:5]}")
             raise ValueError(
                 f"{name}_list structure is invalid. Expected List[Tuple[str, Tensor]]."
             )
@@ -170,7 +244,6 @@ def safe_update(
             logger.warning(
                 f"🔍 [calibrate] Problematic {name}_list sample: {source[:5]}"
             )
-            return  # Quietly skip update if not strict
 
 
 def unwrap_to_transformer(model: nn.Module) -> nn.Module:
