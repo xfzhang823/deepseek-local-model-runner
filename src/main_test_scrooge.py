@@ -4,7 +4,7 @@ import logging
 import logging_config
 from loaders.awq_loader import AWQ_ModelLoader
 from safetensors.torch import load_file
-from scrooge_quant_pipeline import scrooge_quant_pipeline
+from pipelines.scrooge_quant_pipeline import scrooge_quant_pipeline
 from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR
 import logging_config
 

@@ -1,9 +1,12 @@
 """quantize_utils.py"""
 
+import os
+import logging
 from typing import Any, Dict, List, Tuple, Union, Optional
 import torch
 import torch.nn as nn
-import logging
+from awq.modules.linear import WQLinear_GEMM
+from awq.utils.module import set_op_by_name
 
 logger = logging.getLogger(__name__)
 
@@ -115,60 +118,6 @@ def flatten_scales_or_clip_list(
     return flattened
 
 
-# Commented out: previous version
-# def flatten_scales_or_clip_list(
-#     scales_or_clip_list: List[ScaleEntry],
-# ) -> List[Tuple[str, torch.Tensor]]:
-#     """
-#     Flattens a list of scale tuples into a format compatible with `dict()`.
-
-#     Args:
-#         scales_list: A list of tuples representing scale mappings. Each item is either:
-#             - A 2-tuple: (layer_name: str, scale: Tensor)
-#             - A 3-tuple: (prefix: str, subnames: Tuple[str] or List[str], scale: Tensor)
-
-#     Returns:
-#         A flat list of 2-tuples: List[(str, Tensor)], where each key is a dot-prefixed name
-#         like "prefix.subname".
-
-#     Raises:
-#         ValueError: If any entry is malformed or not a tuple of expected length.
-#     """
-#     if not isinstance(scales_or_clip_list, list):
-#         raise TypeError(
-#             f"Expected a list of tuples, got {type(scales_list)}: {scales_list}"
-#         )
-#     flattened: List[Tuple[str, torch.Tensor]] = []
-
-#     for entry in scales_or_clip_list:
-#         if not isinstance(entry, tuple):
-#             raise ValueError(f"scales_list should contain only tuples: {entry}")
-
-#         if len(entry) == 2:
-#             key, tensor = entry
-#             if not isinstance(key, str) or not isinstance(tensor, torch.Tensor):
-#                 raise ValueError(f"Invalid 2-tuple entry: {entry}")
-#             flattened.append((key, tensor))
-
-#         elif len(entry) == 3:
-#             prefix, subkeys, tensor = entry
-#             if not isinstance(prefix, str) or not isinstance(tensor, torch.Tensor):
-#                 raise ValueError(f"Invalid 3-tuple entry: {entry}")
-#             if not isinstance(subkeys, (tuple, list)):
-#                 raise ValueError(f"Expected list or tuple for subkeys in: {entry}")
-
-#             for name in subkeys:
-#                 if not isinstance(name, str):
-#                     raise ValueError(f"Subkey must be a string in: {entry}")
-#                 full_key = f"{prefix}.{name}"
-#                 flattened.append((full_key, tensor))
-
-#         else:
-#             raise ValueError(f"Invalid scales_list entry length: {entry}")
-
-#     return flattened
-
-
 def get_safe_parallel_sample_count() -> int:
     """
     Get the SAFE no. of parallel sample, given the device's vram.
@@ -246,32 +195,6 @@ def safe_update(
             )
 
 
-def unwrap_to_transformer(model: nn.Module) -> nn.Module:
-    """
-    Utils function to extract models from wrappers (common structure among LLMs).
-
-    Traverse model wrappers to find the true transformer (e.g., Qwen2Model).
-
-    Handles:
-    - AutoAWQForCausalLM
-    - Qwen2ForCausalLM
-    - Qwen2Model
-    """
-    if hasattr(model, "model") and hasattr(model.model, "model"):
-        # Example: AutoAWQForCausalLM -> Qwen2ForCausalLM -> Qwen2Model
-        return model.model.model
-    elif hasattr(model, "model") and hasattr(model.model, "layers"):
-        # Example: Qwen2ForCausalLM -> Qwen2Model
-        return model.model
-    elif hasattr(model, "layers"):
-        # Already unwrapped
-        return model
-    else:
-        raise AttributeError(
-            "Could not unwrap model to transformer. Unexpected structure."
-        )
-
-
 def inspect_calib_stats(path: str):
     """
     Inspect and validate a saved calibration stats file.
@@ -330,3 +253,115 @@ def inspect_calib_stats(path: str):
             print("   ...")
 
     print("")  # trailing newline for readability
+
+
+def load_quantized_layers_into_model(
+    model: nn.Module,
+    load_dir: str,
+    w_bit: int,
+    group_size: int,
+    in_features: int,
+    out_features: int,
+    device: str = "cpu",
+) -> nn.Module:
+    """
+    Load quantized layers from disk and insert them into the model.
+
+    Args:
+        model (nn.Module): Model structure to populate.
+        load_dir (str): Directory with .pt files.
+        w_bit (int): Weight bit-width (usually 4).
+        group_size (int): Quantization group size.
+        in_features (int): Default in_features for WQLinear_GEMM.
+        out_features (int): Default out_features for WQLinear_GEMM.
+        device (str): Target device ("cpu" or "cuda").
+
+    Returns:
+        nn.Module: Model with layers replaced by WQLinear_GEMM.
+    """
+    for file_name in os.listdir(load_dir):
+        if not file_name.endswith(".pt"):
+            continue
+
+        module_path = file_name[:-3]  # strip ".pt"
+        file_path = os.path.join(load_dir, file_name)
+        data = torch.load(file_path, map_location="cpu")
+
+        bias = data.get("bias") is not None
+
+        layer = WQLinear_GEMM(
+            w_bit=w_bit,
+            group_size=group_size,
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            dev=device,
+        )
+
+        layer.qweight = data["qweight"].to(device)
+        layer.qzeros = data["qzeros"].to(device)
+        layer.scales = data["scales"].to(device)
+
+        if bias:
+            layer.bias = data["bias"].to(device)
+
+        set_op_by_name(model, module_path, layer)
+        print(f"Loaded and set {module_path} from {file_name}")
+
+    return model
+
+
+def persist_quantized_layer(module: nn.Module, save_dir: str) -> None:
+    """
+    Persist quantized layers to disk using full dot-path names.
+
+    Args:
+        module (nn.Module): The quantized model (containing WQLinear_GEMM layers).
+        save_dir (str): Directory to save the quantized layer files.
+
+    Returns:
+        None
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    for module_name, sub_module in module.named_modules():
+        if isinstance(sub_module, WQLinear_GEMM):
+            file_path = os.path.join(save_dir, f"{module_name}.pt")
+
+            quant_data = {
+                "qweight": sub_module.qweight.clone().cpu(),
+                "qzeros": sub_module.qzeros.clone().cpu(),
+                "scales": sub_module.scales.clone().cpu(),
+            }
+
+            if sub_module.bias is not None:
+                quant_data["bias"] = sub_module.bias.clone().cpu()
+
+            torch.save(quant_data, file_path)
+            print(f"Persisted {module_name} to {file_path}")
+
+
+def unwrap_to_transformer(model: nn.Module) -> nn.Module:
+    """
+    Utils function to extract models from wrappers (common structure among LLMs).
+
+    Traverse model wrappers to find the true transformer (e.g., Qwen2Model).
+
+    Handles:
+    - AutoAWQForCausalLM
+    - Qwen2ForCausalLM
+    - Qwen2Model
+    """
+    if hasattr(model, "model") and hasattr(model.model, "model"):
+        # Example: AutoAWQForCausalLM -> Qwen2ForCausalLM -> Qwen2Model
+        return model.model.model
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+        # Example: Qwen2ForCausalLM -> Qwen2Model
+        return model.model
+    elif hasattr(model, "layers"):
+        # Already unwrapped
+        return model
+    else:
+        raise AttributeError(
+            "Could not unwrap model to transformer. Unexpected structure."
+        )

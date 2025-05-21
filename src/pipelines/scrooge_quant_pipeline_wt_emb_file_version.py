@@ -149,8 +149,8 @@ def scrooge_quant_pipeline(
     )  # Debug — this should now be Qwen2Model
 
     # 3. Calibrate
-    quantizer.calibrate(
-        save_path=save_dir_path,
+    quantizer.calibrate_and_quantize(
+        save_dir_path=save_dir_path,
         clear_inps=True,
     )
 

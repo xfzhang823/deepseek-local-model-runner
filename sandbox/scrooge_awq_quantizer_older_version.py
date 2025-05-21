@@ -62,7 +62,6 @@ END
 
 """
 
-from pathlib import Path
 import logging
 import os
 import time
@@ -76,11 +75,10 @@ from transformers import PreTrainedModel
 from huggingface_hub import snapshot_download, save_torch_state_dict
 
 from awq.quantize.quantizer import AwqQuantizer
+from awq.quantize.scale import apply_scale, apply_clip
 from awq.utils.module import (
     get_named_linears,
     get_op_name,
-    get_op_by_name,
-    set_op_by_name,
     exclude_layers_to_not_quantize,
     append_str_prefix,
 )
@@ -96,14 +94,7 @@ from quantize.quantize_utils import (
     flatten_scales_or_clip_list,
     ScaleEntry,
     get_safe_parallel_sample_count,
-    persist_quantized_layer,
-    load_quantized_layers_into_model,
 )
-from quantize.scrooge_scale import (
-    apply_scale,
-    apply_clip,
-    normalize_scales_across_group,
-)  # import apply_scale from custom scale module
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +121,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         n_parallel_calib_samples: int = get_safe_parallel_sample_count(),
         # ! Need to set this low if GPU is small (to 4 or 2 for small VRAM)
         group_size: int = 128,
-        save_dir: Optional[str] = None,
-        save_per_layer: bool = True,
     ):
         """
         * Need to set __init__ b/c we are "hijacking" the official autoawq model
@@ -183,26 +172,16 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.max_calib_samples: int = max_calib_samples
         self.max_calib_seq_len: int = max_calib_seq_len
         self.apply_clip: bool = apply_clip
-        self.n_parallel_calib_samples: int = n_parallel_calib_samples
-        self.group_size: int = group_size  # Standard default for AWQ
-        self.save_dir: Optional[str] = save_dir
-        self.save_per_layer: bool = save_per_layer
+        self.n_parallel_calib_samples = n_parallel_calib_samples
 
-        # Ensure save directory is created only if provided
-        if self.save_dir:
-            os.makedirs(self.save_dir, exist_ok=True)
-
-        # Paths to store layer-wise quantized models if `save_per_layer` is True
-        self.layer_paths: List[str] = [] if save_per_layer else []
-
-        # ✅ Layer management
+        # ✅ Calibration state (initialized later)
         self.modules: Optional[List[nn.Module]] = None
         self.module_kwargs: Optional[Dict[str, Any]] = None
         self.inps: Optional[torch.Tensor] = None
 
         # ✅ Calibration results
-        self.all_scales: List[Tuple[str, torch.Tensor]] = []
-        self.all_clips: List[Tuple[str, torch.Tensor]] = []
+        self.all_scales: Optional[Dict[str, torch.Tensor]] = None
+        self.all_clips: Optional[Dict[str, torch.Tensor]] = None
 
         # ✅ Calibration dataset
         self.calib_data = None
@@ -210,14 +189,11 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.text_column = "text"
         self.dataset_name = "pileval"
 
-        logger.info(
-            f"Initialized ScroogeAwqQuantizer with save_per_layer={self.save_per_layer}"
-        )
-
         # ✅ Others:
         self.modules_to_not_convert = []  # empty = quantize everything
+        self.group_size = group_size  # Standard default for AWQ
         self.max_chunk_memory = 64 * 1024 * 1024  # 64 MB
-        # * standard default is 1024 MB (too large for most consumer laptop GPUs)
+        # * standard default is 1024 MB (dialed it down due to smaller GPU size
         # amount of memory allowed when chunking/calibrating activations for scale search.
         self.duo_scaling = False
         self.zero_point = False  # Set to symmetric
@@ -615,8 +591,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         the quantizer to run calibration immediately.
 
         Args:
-            embeddings (torch.Tensor): Precomputed input activations [n_samples, seq_len,
-                hidden_dim].
+            embeddings (torch.Tensor): Precomputed input activations [n_samples, seq_len, hidden_dim].
             expected_num_samples (int, optional): Sanity check to verify input batch size.
 
         Sets:
@@ -644,544 +619,379 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         logger.info("✅ Quantizer is ready to calibrate using precomputed embeddings.")
 
-    def init_calibration(self) -> None:
-        """
-        Initialize the calibration data including model layers, input activations, and kwargs.
-        """
-        logger.info("Initializing calibration inputs...")
-
-        try:
-            # Prepare calibration inputs using init_quant
-            self.modules, self.module_kwargs, self.inps = self.init_quant(
-                n_samples=self.max_calib_samples, max_seq_len=self.max_calib_seq_len
-            )
-            logger.info("Calibration inputs initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize calibration data: {e}")
-            raise
-
-    @override
-    @torch.no_grad()
-    def _search_best_scale(
+    def calibrate(
         self,
-        module: nn.Module,
-        prev_op: nn.Module,
-        layer: nn.Linear,
-        inp: torch.Tensor,
-        module2inspect: Optional[nn.Module] = None,
-        kwargs: Optional[dict] = None,
-    ) -> Tuple[str, Tuple[str], torch.Tensor]:
-        """
-        AWQ-style group-wise scale search for a single Linear layer.
-
-        This method normalizes weights per group and computes scale values
-        that balance quantized weight distribution and input activation dynamics.
-
-        Args:
-            module: Parent container (e.g., TransformerBlock).
-            prev_op: Previous op (LayerNorm, GELU, etc.) used for applying scale.
-            layer: The single Linear layer to calibrate.
-            inp: Input tensor to the layer (typically float16).
-            module2inspect: Defaults to `layer`, only used for forward().
-            kwargs: Additional kwargs to pass to forward pass (e.g., attention mask).
-
-        Mathematical Steps:
-        - Grouped Weight Normalization:
-            w_grouped = weight.view(O, G, group_size)
-            w_scaled = |w_grouped| / max(|w_grouped|)  → [0, 1] within each group
-            w_mean = mean(w_scaled, dim=1)  → [out_features]
-        - Input Mean (chunked):
-            x_mean = mean(abs(input), dim=0) over all positions
-        - Final:
-            best_scales = _compute_best_scale(inp, w_mean, x_mean, ...)
-
-        WORKFLOW:
-        1. Weight Grouping:
-            - Split weights into groups of `group_size` along the input dimension.
-            - Normalize each group:  w_scaled = |W| / max(|W|_group)
-            - Collapse back to [out_features, in_features]
-            - Compute mean(w_scaled) per output channel → `w_mean ∈ [out_features]`
-
-        2. Input Mean Calculation:
-            - Flatten input → [N, in_features]
-            - Compute per-channel input mean (chunked) → `x_mean ∈ [in_features]`
-
-        3. Forward Pass:
-            - Forward the input through the inspected layer to obtain `fp16_output`.
-
-        4. Optimize Scale:
-            - Compute final per-channel `best_scales` that minimize quantization loss.
-
-        ┌──────────────────────────────────────────────────┐
-        │        Input: layer.weight ∈ [O, I]              |
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 1: Reshape to groups                       │
-        │  weight_grouped ∈ [O, G, group_size]             │
-        │  where G = I // group_size                       │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 2: Normalize each group                    │
-        │  w_scaled = |w| / max(|w|_group) ∈ [O, G, group] │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 3: Restore shape and aggregate             │
-        │  w_scaled.view(O, I)                             │
-        │  w_mean ∈ [O] ← mean over input_dim              │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 4: Compute input mean                      │
-        │  x_mean ∈ [I] ← chunked abs mean                 │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 5: Forward Pass                            │
-        │  fp16_output = layer(inp)                        │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 6: Optimize Scales                         │
-        │  best_scales = _compute_best_scale(...) ∈ [O]    │
-        └──────────────────────────────────────────────────┘
-
-        Returns:
-            Tuple of:
-            - Previous op name (str)
-            - Target layer name (tuple of one str)
-            - Computed scale tensor: [out_features] (float16 or bfloat16)
-        """
-        layer_name = get_op_name(module, layer)
-        module2inspect = module2inspect or layer
-        kwargs = kwargs or {}
-
-        # --- STEP 1: Compute grouped weight mean ---
-        try:
-            weight = layer.weight.detach()
-            out_features, in_features = weight.shape
-
-            if self.group_size <= 0:
-                raise ValueError("group_size must be > 0 for group quantization.")
-
-            if in_features % self.group_size != 0:
-                raise ValueError(
-                    f"[{layer_name}] in_features={in_features} not divisible by group_size={self.group_size}"
-                )
-
-            num_groups = in_features // self.group_size
-            weight_grouped = weight.view(out_features, num_groups, self.group_size)
-
-            w_max = weight_grouped.abs().amax(dim=-1, keepdim=True) + 1e-6
-            w_scaled = weight_grouped.abs() / w_max
-            w_scaled_restored = w_scaled.view(out_features, in_features)
-            w_mean = w_scaled_restored.mean(dim=1)  # [out_features]
-
-            logger.debug(f"[{layer_name}] w_mean.shape = {w_mean.shape}")
-
-            clear_memory(weight_grouped)
-
-        except Exception as e:
-            logger.error(f"[{layer_name}] Error during weight scale computation: {e}")
-            raise
-
-        # --- STEP 2: Compute input activation mean (chunked) ---
-        try:
-            inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])
-            num_elements = inp_flat.size(0)
-            num_channels = inp_flat.size(1)
-            element_size_bytes = inp_flat.element_size() * 2  # FP32 size
-
-            chunk_size = self.max_chunk_memory // (element_size_bytes * num_channels)
-            chunk_size = min(chunk_size, num_elements)
-
-            x_sum = torch.zeros(num_channels, dtype=torch.float32)
-            for i in range(0, num_elements, chunk_size):
-                end = min(i + chunk_size, num_elements)
-                chunk_sum = inp_flat[i:end].to(torch.float32).sum(dim=0)
-                x_sum += chunk_sum.to("cpu")  # device-safe addition
-
-            x_mean = (x_sum / num_elements).to(inp.dtype)
-
-            logger.debug(f"[{layer_name}] x_mean.shape = {x_mean.shape}")
-
-            clear_memory(x_sum)
-
-        except Exception as e:
-            logger.error(f"[{layer_name}] Error during input mean computation: {e}")
-            raise
-
-        # --- STEP 3: Forward pass for FP16 output ---
-        try:
-            module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
-            fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
-            fp16_output = fp16_output.clip(
-                torch.finfo(fp16_output.dtype).min,
-                torch.finfo(fp16_output.dtype).max,
-            )
-        except Exception as e:
-            logger.error(f"[{layer_name}] Forward pass failed: {e}")
-            raise
-
-        # --- STEP 4: Optimize scale using loss search ---
-        try:
-            best_scales = self._compute_best_scale(
-                inp,
-                w_mean,
-                x_mean,
-                module2inspect,
-                [layer],
-                fp16_output,
-                module_kwargs,
-            )
-            logger.debug(f"[{layer_name}] best_scales.shape = {best_scales.shape}")
-        except Exception as e:
-            logger.error(f"[{layer_name}] Failed to compute best scale: {e}")
-            raise
-
-        # --- Cleanup ---
-        del inp, fp16_output
-        clear_memory()
-
-        return (
-            get_op_name(module, prev_op),
-            (layer_name,),
-            best_scales,
-        )
-
-    @override
-    @torch.no_grad()
-    def _search_best_clip(
-        self,
-        layer: nn.Module,
-        named_linears: Dict[str, nn.Linear],
-        input_feat: torch.Tensor,
-    ) -> Tuple[str, Optional[float]]:
-        """
-        AWQ-style clipping threshold search for a single Linear layer.
-
-        This computes the max absolute activation value (clipping range)
-        that minimizes quantization loss, unless the layer is excluded
-        from clipping by name.
-
-        Args:
-            layer (nn.Module): Linear layer being calibrated.
-            named_linears (Dict[str, nn.Linear]): Mapping of layer names for lookups.
-            input_feat (torch.Tensor): Input activation for the given layer.
-
-        ---
-        🧠 Workflow:
-
-            Input:
-                - weight ∈ [out_features, in_features]
-                - input_feat ∈ [batch_size, in_features]
-
-            ┌────────────────────────────────────────────┐
-            │ Step 1: Layer Name Filter                  │
-            │  - Skip known layers like q_proj, k_proj   │
-            └────────────────────────────────────────────┘
-                        │
-                        ▼
-            ┌────────────────────────────────────────────┐
-            │ Step 2: Move to Device                     │
-            │  - Prepare layer for forward operation     │
-            └────────────────────────────────────────────┘
-                        │
-                        ▼
-            ┌────────────────────────────────────────────┐
-            │ Step 3: Compute Clipping Threshold         │
-            │  - Use input_feat and weight               │
-            │  - Output: max_val_tensor ∈ scalar (tensor)│
-            └────────────────────────────────────────────┘
-                        │
-                        ▼
-            ┌────────────────────────────────────────────┐
-            │ Step 4: Convert and Return                 │
-            │  - Return (layer_name, float threshold)    │
-            └────────────────────────────────────────────┘
-
-        ---
-        Returns:
-            Tuple[str, Optional[float]]:
-                - Layer name as string
-                - Float clipping threshold or None (if skipped)
-        """
-        layer_name = get_op_name(self.model, layer)
-
-        # Heuristically skip clipping for attention Q/K heads
-        avoid_clipping_tags = ["q_", "k_", "query", "key", "Wqkv"]
-        if any(tag in layer_name for tag in avoid_clipping_tags):
-            logger.info(
-                f"🛑 Skipping clipping for {layer_name} (matches exclusion list)."
-            )
-            return layer_name, None
-
-        try:
-            layer = layer.to(get_best_device())
-            logger.debug(
-                f"[{layer_name}] moved to {layer.weight.device} for clipping calc."
-            )
-
-            max_val_tensor = self._compute_best_clip(layer.weight, input_feat)
-            max_val: float = max_val_tensor.item()
-
-            logger.info(f"[{layer_name}] best clip value = {max_val:.4f}")
-            return layer_name, max_val
-
-        except Exception as e:
-            logger.error(f"❌ Error computing clip for {layer_name}: {e}")
-            return layer_name, None
-
-        finally:
-            layer.cpu()
-            logger.debug(f"[{layer_name}] moved back to CPU after clip search.")
-
-    @torch.no_grad()
-    def compute_zeros(
-        self,
-        weight: torch.Tensor,
-        scales: torch.Tensor,
-        group_size: int,
-    ) -> torch.Tensor:
-        """
-        * Custom function replace official code's pseudo_quantize_tensor method's
-        * compute zeros functionality
-
-        Compute zero-points for symmetric group-wise quantization.
-
-        Each group of weights is assigned a zero-point based on the mean value
-        of the weights in that group. This helps shift the quantized representation
-        toward a centered range, reducing quantization error.
-
-        ---
-        🧠 Formula:
-            zero = floor(-mean(weight_group) / scale + 0.5)
-
-        ---
-        📉 Workflow
-
-            weight ∈ [out_features, in_features]
-                            │
-                            ▼
-            ┌──────────────────────────────┐
-            │ Group along input dim        │
-            │ → groups = in_features // G  │
-            └──────────────────────────────┘
-                            │
-                            ▼
-            ┌────────────────────────────────┐
-            │ For each group i:              │
-            │   W_i = weight[:, i*G:(i+1)*G] │
-            │   μ_i = mean(W_i)              │
-            │   z_i = floor(-μ_i / s_i + 0.5)│
-            └────────────────────────────────┘
-                            │
-                            ▼
-            Output: zeros ∈ [num_groups]
-
-        ---
-        Args:
-            weight (torch.Tensor): The full linear layer weight [O, I]
-            scales (torch.Tensor): Precomputed scales per group [num_groups]
-            group_size (int): Number of input dims per quant group
-
-        Returns:
-            torch.Tensor: Zero-points per group [num_groups]
-        """
-        out_features, in_features = weight.shape
-        if in_features % group_size != 0:
-            raise ValueError(
-                f"Invalid group size: in_features={in_features} is not divisible by group_size={group_size}"
-            )
-
-        num_groups = in_features // group_size
-        zeros = torch.empty(num_groups, device=weight.device)
-
-        for i in range(num_groups):
-            group_weights = weight[:, i * group_size : (i + 1) * group_size]
-            group_mean = group_weights.mean()
-            scale = scales[i]
-            zero_point = torch.floor(-group_mean / scale + 0.5)
-            zeros[i] = zero_point
-
-            logger.debug(
-                f"[Group {i}] mean={group_mean.item():.6f}, scale={scale.item():.6f}, zero={zero_point.item():.2f}"
-            )
-
-        logger.info(f"✅ Computed zero-points: shape={zeros.shape}")
-        return zeros
-
-    def calibrate_and_quantize(
-        self, save_dir_path: Optional[str | Path] = None
+        save_path: Optional[str] = None,
+        clear_inps: bool = True,
     ) -> None:
         """
-        Runs full Scrooge-style calibration and quantization in a single pass.
+        * Calibrate the model layers for AWQ quantization.
 
-        This method processes the model block by block, performing all necessary steps:
-            1. Captures input activations per block.
-            2. Computes optimal per-channel scales (per layer).
-            3. Normalizes group-wise scales to share a consistent quantization range.
-            4. Applies those scales to weights (and optionally to activations).
-            5. Computes zero-points and (optionally) clipping thresholds.
-            6. Replaces original Linear layers with quantized WQLinear_GEMM modules.
-            7. Saves quantized weights and configs if `save_dir_path` is specified.
+        This method performs layer-by-layer calibration across two distinct
+        phases:
+        - Staging Phase: Describe what to calibrate (selecting Linear layers
+        and grouping them).
+        - Computing Phase: Search for optimal scaling factors (and optionally
+        clipping thresholds).
 
-        Key Features:
-            - Activations are captured and discarded per layer to minimize VRAM usage.
-            - Input activations (`self.inps`) are automatically cleared after use.
-            - Scales and clips are tracked internally in `self.all_scales` and
-            `self.all_clips`.
+        ----------
+        Detailed Step-by-Step Process:
 
-        Args:
-            save_dir_path (Optional[str | Path]):
-                If provided, saves quantized model weights and metadata to this path.
+        1. **Initialization:**
+            - Unwrap nested model if needed (self.model.model).
+            - Move embedding layers (embed_tokens, rotary_emb) to GPU or
+            best device.
+            - Run init_quant() to prepare calibration samples and capture
+            initial activations.
 
-        Raises:
-            RuntimeError: If `self.modules` is not initialized.
-            ValueError: If no calibration scales are generated.
+        2. **Module Calibration Loop:**
+            For each Transformer block/module:
 
-        Logging:
-            - Logs per-layer progress and timing.
-            - Logs number of scale and clip entries computed.
-            - Logs total elapsed time for the full pipeline.
+            2.1 **Inference Step (Activation Capture):**
+                - Run the module's forward pass over calibration inputs.
+                - Capture input activations into `input_feat`.
+                - Structure: Dict mapping layer names → activation tensors
+                (torch.Tensor).
+
+            2.2 **Staging Phase (Describing What to Calibrate):**
+                - Call `get_layers_for_scaling()` to generate `module_config`:
+                    - Each entry describes:
+                        - prev_op: Previous operation (e.g., LayerNorm)
+                        - layers: List of Linear submodules
+                        (e.g., [q_proj, k_proj, v_proj])
+                        - inp: Input activation tensor
+                        - module2inspect: Target module
+                        - kwargs: Optional extra arguments
+                - Merged projection layers (e.g., QKV combined) are automatically
+                grouped here.
+
+            2.3 **Computing Phase (Scale and Clip Search):**
+                - Call `_search_best_scale()` for each group:
+                    - Search per-channel scaling factors that minimize quantization
+                    loss.
+                - If `apply_clip=True`, call `_search_best_clip()`:
+                    - Find optimal clipping thresholds to clamp activations.
+                    - Improve quantization robustness against outliers.
+
+            2.4 **Post-module Cleanup:**
+                - After calibrating each module, call `clear_memory()` to free GPU RAM.
+
+        3. **Finalization:**
+            - Save calibration statistics (`all_scales`, `all_clips`) to `save_path`
+            if provided.
+            - Update object state: self.all_scales, self.all_clips.
+            - Optionally clear calibration inputs (self.inps) to save RAM.
+
+        ----------
+        Parameters:
+            save_path (Optional[str], default=None):
+                Path to save calibration statistics (scales and clips).
+            clear_inps (bool, default=True):
+                Whether to delete captured input activations (self.inps) after calibration.
+            precomputed_embeds (torch.Tensor, optional): Precomputed input embeddings.
+                If provided, skips sampling and embedding steps.
+        ----------
+        Outputs:
+            Updates self.all_scales: Dict[str, torch.Tensor]
+            Updates self.all_clips: Dict[str, torch.Tensor] (only if clipping applied)
+
+        ----------
+        Important Notes:
+        - Capturing input activations (input_feat) happens per module during init_quant().
+        - Calibration uses a "describe first, compute later" model to separate concerns
+        cleanly.
+        - Supports both standard architectures and merged projections
+        (e.g., fused c_attn layers).
+        - clear_memory() is used aggressively between modules
+        to manage GPU memory pressure.
+
+        ----------
+        Logging/Debugging:
+        - Structured logs for every major phase (model moves, module calibration,
+        memory cleanup).
+        - Errors caught for model moving, calibration, and save operations.
         """
+
         start_time = time.time()
-        logger.info("🚀 [calibrate] Starting full quantization pass")
+        logger.info("🚀 [calibrate] Starting AWQ calibration...")
 
-        self.init_calibration()
-        self.model = self.model.to(device)
+        # Move model embedding layers to GPU and unwrap
+        device = get_best_device()
 
-        if self.modules is None or self.inps is None:
-            raise RuntimeError("Calibration data (modules or inputs) not initialized.")
+        # if hasattr(self.model, "model"):
+        #     logger.info("🔍 [calibrate] Unwrapping nested model (self.model.model).")
+        #     self.model = self.model.model
 
-        total_layers_quantized = 0
-        for idx, module in enumerate(self.modules):  # * ☑️ Outer loop
+        # ✅ Don't unwrap!
+        logger.info(
+            f"✅ [calibrate] Model remains as {self.model.__class__} — wrapper preserved."
+        )
+
+        try:
+            self.model.model.model.embed_tokens = (
+                self.model.model.model.embed_tokens.to(device)
+            )
+            self.model.model.model.rotary_emb = self.model.model.model.rotary_emb.to(
+                device
+            )
+            logger.info(f"✅ [calibrate] Embedding layers moved to device: {device}")
+        except Exception as e:
+            logger.error(
+                f"❌ [calibrate] Failed to move embedding layers to device: {e}"
+            )
+            raise
+
+        # Confirm model has layers
+        if not (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "model")
+            and hasattr(self.model.model.model, "layers")
+        ):
+            raise AttributeError(
+                "Model must have nested .model.model.layers (e.g. for DeepSeek or Qwen2)"
+            )
+        else:
             logger.info(
-                f"\n🔍 [Block {idx}/{len(self.modules)}] Processing {module.__class__.__name__}"
+                "✅ [calibrate] Model structure validated — using self.model.model.model.layers"
             )
+
+        # Step 1: Generate calibration inputs via init_quant
+        try:
+            self.modules, self.module_kwargs, self.inps = self.init_quant(
+                n_samples=self.max_calib_samples,
+                max_seq_len=self.max_calib_seq_len,
+            )
+            logger.info("✅ [calibrate] Calibration inputs initialized.")
+        except Exception as e:
+            logger.error(f"❌ [calibrate] Failed during init_quant(): {e}")
+            raise
+
+        all_scales: Dict[str, torch.Tensor] = {}
+        all_clips: Dict[str, torch.Tensor] = {}
+
+        assert self.modules is not None, "self.modules must be set before calibration"
+
+        # Step 2: Per-module calibration
+        for i, module in enumerate(self.modules):
+            logger.info(f"🔍 [calibrate] Processing module {i}/{len(self.modules)}")
+
             module = module.to(device)
-            self.modules[idx] = module
+            self.modules[i] = module
 
+            # Get input features by running hooks
+            named_linears = get_named_linears(module)
             named_linears = exclude_layers_to_not_quantize(
-                get_named_linears(module), self.modules_to_not_convert
+                named_linears, self.modules_to_not_convert
             )
-            name_to_layer = {v: k for k, v in named_linears.items()}
-
             input_feat = self._get_input_feat(module, named_linears)
             input_feat = {k: v.to(device) for k, v in input_feat.items()}
-            logger.debug(f"[Block {idx}] Input features captured.")
+            logger.info(
+                f"[calibrate] Input features for module {i} captured and moved to device."
+            )
 
-            module_config = self.awq_model.get_layers_for_scaling(
+            # todo: debug; delete later
+            if input_feat["self_attn.k_proj"].std() < 1e-6:
+                logger.warning(
+                    f"[Flat k_proj activation] Layer {i}, std={input_feat["self_attn.k_proj"].std:.6f}"
+                )
+            if input_feat["self_attn.v_proj"].std() < 1e-6:
+                logger.warning(
+                    f"[Flat v_proj activation] Layer {i}, std={input_feat["self_attn.v_proj"].std:.6f}"
+                )
+
+            # Get config from model for what to calibrate
+            module_config = self.model.get_layers_for_scaling(
                 module, input_feat, self.module_kwargs
             )
-            logger.debug(f"[Block {idx}] Groups = {len(module_config)}")
 
-            for group in module_config:
-                prev_op = group["prev_op"]
-                layers = group["layers"]
-                group_name = prev_op.__class__.__name__
-
-                logger.info(f"\n⚙️  [Group: {group_name}] {len(layers)} layers")
-
-                # 1. Compute scales per layer
-                scales_dict = {}
-                for layer in layers:
-                    layer_name = name_to_layer.get(layer)
-                    if layer_name is None:
-                        raise ValueError(f"Layer not found in name mapping: {layer}")
-                    logger.info(f"🔎 [scale] {layer_name}")
-
-                    op_name, _, best_scales = self._search_best_scale(
-                        module=module,
-                        prev_op=prev_op,
-                        layer=layer,
-                        inp=input_feat[layer_name],
-                    )
-
-                    best_scales = best_scales.to(device)
-                    scales_dict[layer_name] = best_scales
-                    logger.debug(
-                        f"[scales.raw] {layer_name} → shape: {best_scales.shape}, preview: {best_scales[:5].tolist()}"
-                    )
-
-                # 2. Normalize scales across the group
-                normalized_scales = normalize_scales_across_group(
-                    layers=layers,
-                    name_to_layer=name_to_layer,
-                    scales_dict=scales_dict,
+            # * ✅ Iterate to run actual search for scale!
+            scales_list = []
+            for j, layer in enumerate(module_config):
+                layer_name = layer.get("name", f"Layer_{j}")
+                logger.info(
+                    f"  🔹 [calibrate] Module {i}/{len(self.modules)} — Layer {j}/{len(module_config)}: {layer_name}"
                 )
-                for name, scale_tensor in list(normalized_scales.items()):
-                    logger.debug(
-                        f"[scales.norm] {name} → shape: {scale_tensor.shape}, preview: {scale_tensor[:5].tolist()}"
+
+                # Skip if no sublayers
+                if not layer.get("layers"):
+                    logger.warning(f"⚠️ Skipping {layer_name} — no sublayers found.")
+                    continue
+
+                valid_weights = [
+                    l.weight
+                    for l in layer["layers"]
+                    if hasattr(l, "weight")
+                    and l.weight is not None
+                    and l.weight.shape[0] > 0
+                ]
+
+                # 💥 Final guard: if torch.cat(valid_weights) would be empty
+                if sum(w.shape[0] for w in valid_weights) == 0:
+                    logger.warning(
+                        f"⚠️ Skipping {layer.get('name', 'unknown')} — concatenated weight would be empty."
                     )
+                    continue
 
-                # 3. Apply scale, compute zeros, clip, quantize
-                for layer in layers:
-                    layer_name = name_to_layer[layer]
+                logger.info(f"🧪 Start _search_best_scale on module {i}, layer {j}")
+                start_scale = time.time()
 
-                    # Apply scales
-                    scales = normalized_scales[layer_name]
-                    logger.info(f"🧪 [apply] {layer_name}")
+                # * Search for scale
+                # ☑️ Returned format: ("name", ("subname1", "subname2"), tensor)
+                # i.e., ("post_attention_layernorm", ("mlp.gate_proj", "mlp.up_proj"), tensor([...]))
+                scale_data = self._search_best_scale(module, **layer)
 
-                    apply_scale(
-                        module, [(get_op_name(module, prev_op), (layer_name,), scales)]
+                # Log the returned scale data
+                logger.debug(
+                    f"Scale data received from _search_best_scale: {scale_data} (type: {type(scale_data)})"
+                )
+
+                # Fallback handling for None
+                if scale_data is None:
+                    logger.warning(
+                        f"Scale data is None for layer {layer_name}. Skipping."
                     )
+                    continue
 
-                    # Apply clips
-                    if self.apply_clip:
-                        # Optional clipping
-                        input_feat_tensor = input_feat.get(layer_name) or torch.empty(0)
-                        clip_name, clip_value = self._search_best_clip(
-                            layer=layer,
-                            named_linears=named_linears,
-                            input_feat=input_feat_tensor,
+                # Directly create ScaleEntry without unpacking
+                # ☑️ ScaleEntry(
+                #       name="post_attention_layernorm",
+                #       subnames=["mlp.gate_proj", "mlp.up_proj"],
+                #       value=tensor([...])
+                #     )
+                # ☑️ scales_list = [
+                #       ScaleEntry(name="input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
+                #       ScaleEntry(name="post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
+                #       ScaleEntry(name="mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
+                #     ]
+                if isinstance(scale_data, tuple) and len(scale_data) == 3:
+                    scales_list.append(
+                        ScaleEntry(
+                            name=scale_data[0],
+                            subnames=list(scale_data[1]),
+                            value=scale_data[2],
                         )
-                        if clip_value is not None:
-                            apply_clip(module, clip_name, clip_value)
-                            logger.info(f"[clip] {clip_name} ← {clip_value:.4f}")
-                        else:
-                            logger.debug(f"[clip] {clip_name} skipped")
+                    )
+                else:
+                    logger.warning(f"Unexpected scale data structure: {scale_data}")
+                    continue
 
-                    # Compute zeros
-                    zeros = self.compute_zeros(layer.weight, scales, self.group_size)
+                elapsed_scale = time.time() - start_scale
+                logger.info(
+                    f"⏱️ [timing] Scale search took {elapsed_scale:.2f} seconds for module {i}, layer {j}"
+                )  # logging time
+
+            try:
+                # ☑️ Add prefix -> this format:
+                # [
+                #   ScaleEntry(name="model.model.layers.0.input_layernorm", subnames=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"], value=tensor([...])),
+                #   ScaleEntry(name="model.model.layers.0.post_attention_layernorm", subnames=["mlp.gate_proj", "mlp.up_proj"], value=tensor([...])),
+                #   ScaleEntry(name="model.model.layers.0.mlp.up_proj", subnames=["mlp.down_proj"], value=tensor([...]))
+                # ]
+                scales_list = append_str_prefix(
+                    scales_list, get_op_name(self.model, self.modules[i]) + "."
+                )
+
+                # ☑️ flatten nested before saving -> expected format (in tuples already):
+                # [
+                #   ("model.model.layers.0.input_layernorm.self_attn.q_proj", tensor([...]))
+                #   ("model.model.layers.0.input_layernorm.self_attn.k_proj", tensor([...]))
+                #   ("model.model.layers.0.input_layernorm.self_attn.v_proj", tensor([...]))
+                # ]
+                flattened = flatten_scales_or_clip_list(
+                    cast(List[ScaleEntry], scales_list)
+                )
+                logger.debug(f"Flattened structure: {flattened}")
+                logger.debug(f"First entry type: {type(flattened[0])}")
+
+                # Extra validation and deduping
+                start_scale = time.time()
+                safe_update(
+                    all_scales, flattened, name="scales", strict=False
+                )  # Relax to the strict mode
+
+                # **Cumulative Check after each module**
+                logger.debug(
+                    f"[Module {i}] Cumulative scales count so far: {len(all_scales)}"
+                )
+
+            except Exception as e:
+                logger.error(f"❌ [calibrate] Failed during scale update: {e}")
+                raise
+
+            if "layers" in layer and isinstance(layer["layers"], list):
+                for l in layer["layers"]:
+                    if l.weight.shape[0] == 0:
+                        logger.warning(f"⚠️ Skipping sublayer {l} — zero-sized output.")
+                        continue
+
+            # Optional clipping (exclude outliers that would skew the scale)
+            if self.apply_clip:
+                try:
+                    logger.info(f"🧪 Start _search_best_clip on module {i}")
+                    start_clip = time.time()
+
+                    clip_list = self._search_best_clip(
+                        module, named_linears, input_feat
+                    )
+
+                    elapsed_clip = time.time() - start_clip
+                    logger.info(
+                        f"⏱️ [timing] Clip search took {elapsed_clip:.2f} seconds for module {i}"
+                    )  # loggging time
+
+                    clip_list = append_str_prefix(
+                        clip_list, get_op_name(self.model, module) + "."
+                    )
+                    flattened = flatten_scales_or_clip_list(
+                        cast(List[ScaleEntry], clip_list)
+                    )  # * flatten nested before saving
+
+                    # Extra validation and deduping
+                    safe_update(
+                        all_clips, flattened, name="clips", strict=True
+                    )  # Enforce strict mode
+
+                    # **Cumulative Check after each module**
                     logger.debug(
-                        f"[zeros] {layer_name} → {zeros.shape}, first: {zeros[:5].tolist()}"
+                        f"[Module {i}] Cumulative clips count so far: {len(all_clips)}"
                     )
 
-                    # Replace sub-layer with quantized GEMM layer
-                    quantized_layer = WQLinear_GEMM.from_linear(
-                        linear=layer,
-                        w_bit=self.w_bit,
-                        group_size=self.group_size,
-                        scales=scales,
-                        zeros=zeros,
-                    )
+                except Exception as e:
+                    logger.error(f"❌ [calibrate] Failed during clip update: {e}")
+                    raise
 
-                    set_op_by_name(
-                        layer=module, name=layer_name, new_module=quantized_layer
-                    )
-                    logger.info(f"✅ Quantized {layer_name} → WQLinear_GEMM")
+            # Free up memory
+            self.modules[i] = module.cpu()
+            clear_memory()
+            logger.info(f"🧹 [calibrate] Memory cleared after module {i}")
 
-                    if save_dir_path:
-                        persist_quantized_layer(
-                            quantized_layer, save_dir=str(save_dir_path)
-                        )
-                        logger.debug(f"💾 Saved {layer_name} to {save_dir_path}")
+        # Save calibration results
+        if save_path:
+            try:
+                torch.save({"scales": all_scales, "clips": all_clips}, save_path)
+                logger.info(
+                    f"💾 [calibrate] Calibration statistics saved to {save_path}"
+                )
+            except Exception as e:
+                logger.error(f"❌ [calibrate] Failed to save stats: {e}")
+                raise
 
-                # Count loops
-                total_layers_quantized += len(layers)
+        self.all_scales = all_scales
+        self.all_clips = all_clips
 
-        logger.info(f"🔢 Total quantized layers: {total_layers_quantized}")
+        if clear_inps:
+            try:
+                del self.inps
+                self.inps = None
+                clear_memory()
+                logger.info("✅ [calibrate] Cleared cached inputs.")
+            except Exception as e:
+                logger.warning(f"⚠️ [calibrate] Failed to clear inputs: {e}")
+
         elapsed = time.time() - start_time
-        logger.info(f"\n🏁 Finished calibration + quantization in {elapsed:.2f} sec")
+        logger.info(
+            f"🏁 [calibrate] Calibration completed in {time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
+        )
 
     def load_calibration_stats(self, calib_stats_path: str) -> None:
         """
@@ -1258,57 +1068,44 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         else:
             logger.debug("No clip data found.")
 
-    def quantize_and_save_layer(
-        self,
-        layer: nn.Module,
-        layer_name: str,
-        scales: torch.Tensor,
-        zeros: torch.Tensor,
-    ) -> nn.Module:
+    def compute_zeros(
+        self, weight: torch.Tensor, scales: torch.Tensor, group_size: int
+    ) -> torch.Tensor:
         """
-        Process a single layer: quantize and optionally save to disk.
+        Compute zero-points dynamically from weight and scales.
+
+        Zero-points are calculated per group based on the mean of weights in each group.
 
         Args:
-            layer (nn.Module): The original linear layer to be quantized.
-            layer_name (str): The name identifier for the layer.
-            scales (torch.Tensor): Precomputed scales for the layer.
-            zeros (torch.Tensor): Precomputed zero points for the layer.
-        """
-        # Quantize the layer
-        quantized_layer = self.quantize_layer(layer, scales, zeros)
-
-        # Save the entire layer with all data (scales, qweight, qzeros)
-        if self.save_per_layer and self.save_dir:
-            save_path = os.path.join(self.save_dir, f"{layer_name}_quant.pt")
-            torch.save(quantized_layer.state_dict(), save_path)
-            self.layer_paths.append(save_path)
-            logger.info(f"Saved quantized layer {layer_name} to {save_path}")
-
-        return quantized_layer
-
-    def quantize_layer(
-        self, layer: nn.Module, scales: torch.Tensor, zeros: torch.Tensor
-    ) -> nn.Module:
-        """
-        Convert a given linear layer to its quantized version using the WQLinear_GEMM class.
-
-        Args:
-            layer (nn.Module): The original linear layer to be quantized.
-            scales (torch.Tensor): Precomputed scales for the layer.
-            zeros (torch.Tensor): Precomputed zero points for the layer.
+            weight (torch.Tensor): The weight tensor to be quantized. Shape: [out_features,
+                in_features].
+            scales (torch.Tensor): Precomputed scales for each group. Shape: [num_groups].
+            group_size (int): Number of elements per group for quantization.
 
         Returns:
-            nn.Module: The quantized version of the input layer.
+            torch.Tensor: Computed zero-points per group. Shape: [num_groups].
+
+        Example:
+            >>> weight = torch.randn(128, 256)
+            >>> scales = torch.ones(128 // 32)
+            >>> zeros = quantizer.compute_zeros(weight, scales, group_size=32)
+
+        Notes:
+            - The zero-point calculation is based on the mean of weights per group and
+            adjusted by the scale.
+            - The calculation formula is: zero = floor(-mean / scale + 0.5).
         """
-        # Convert to quantized linear layer
-        q_linear = WQLinear_GEMM.from_linear(
-            linear=layer,
-            w_bit=self.w_bit,
-            group_size=self.group_size,
-            scales=scales,
-            zeros=zeros,
-        )
-        return q_linear
+        num_groups = weight.shape[1] // group_size
+        zeros = torch.empty(num_groups, device=weight.device)
+
+        for i in range(num_groups):
+            group_weights = weight[:, i * group_size : (i + 1) * group_size]
+            scale = scales[i]
+            zeros[i] = torch.floor(
+                -group_weights.mean() / scale + 0.5
+            )  # Assign per group
+
+        return zeros
 
     def quant_with_calib_scales(self) -> None:
         """

@@ -1,6 +1,6 @@
 # Configure logging with the application name "DeepSeek"
-from logging_config import configure_logging
 import logging
+from logging_config import configure_logging
 
 configure_logging(app_name="DeepSeek")
 
