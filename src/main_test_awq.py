@@ -1,13 +1,14 @@
-import logging
-from pipelines.awq_quant_pipeline import run_awq_quant_pipeline
-import logging_config
+import torch
+import torch.nn as nn
 
-logger = logging.getLogger(__name__)
+layer = nn.Linear(5, 3)
+original_weight = layer.weight
 
+# Detach the weights
+detached_weight = layer.weight.detach()
 
-def main():
-    run_awq_quant_pipeline()
+# Modify the original weights
+layer.weight.data += 1
 
-
-if __name__ == "__main__":
-    main()
+print((layer.weight != original_weight).all())  # Output: True
+print((layer.weight != detached_weight).all())  # Output: True

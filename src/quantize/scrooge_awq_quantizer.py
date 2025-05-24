@@ -106,6 +106,7 @@ from quantize.scrooge_scale import (
 )  # import apply_scale from custom scale module
 
 logger = logging.getLogger(__name__)
+resource_logger = logging.getLogger("resource")
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -573,9 +574,13 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         logger.info(f"🏁 [init_quant] Calibration data initialization complete.")
 
-        log_gpu_usage("Before Clear")
+        log_gpu_usage(
+            "[init_quant] After moving layer 0 + embeddings to CPU"
+        )  # vram logging
         clear_memory()  # Free up memory for next texts
-        log_gpu_usage("After Clear")
+        log_gpu_usage(
+            "[init_quant] After torch.cuda.empty_cache() + gc.collect()"
+        )  # vram logging
 
         # Check if all layers are moved
         for i, layer in enumerate(modules):
@@ -672,6 +677,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         kwargs: Optional[dict] = None,
     ) -> Tuple[str, Tuple[str], torch.Tensor]:
         """
+        * Override official method to search per layer only!
+
         AWQ-style group-wise scale search for a single Linear layer.
 
         This method normalizes weights per group and computes scale values
@@ -685,80 +692,70 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             module2inspect: Defaults to `layer`, only used for forward().
             kwargs: Additional kwargs to pass to forward pass (e.g., attention mask).
 
-        Mathematical Steps:
-        - Grouped Weight Normalization:
-            w_grouped = weight.view(O, G, group_size)
-            w_scaled = |w_grouped| / max(|w_grouped|)  → [0, 1] within each group
-            w_mean = mean(w_scaled, dim=1)  → [out_features]
-        - Input Mean (chunked):
-            x_mean = mean(abs(input), dim=0) over all positions
-        - Final:
-            best_scales = _compute_best_scale(inp, w_mean, x_mean, ...)
-
-        WORKFLOW:
-        1. Weight Grouping:
-            - Split weights into groups of `group_size` along the input dimension.
-            - Normalize each group:  w_scaled = |W| / max(|W|_group)
-            - Collapse back to [out_features, in_features]
-            - Compute mean(w_scaled) per output channel → `w_mean ∈ [out_features]`
-
-        2. Input Mean Calculation:
-            - Flatten input → [N, in_features]
-            - Compute per-channel input mean (chunked) → `x_mean ∈ [in_features]`
-
-        3. Forward Pass:
-            - Forward the input through the inspected layer to obtain `fp16_output`.
-
-        4. Optimize Scale:
-            - Compute final per-channel `best_scales` that minimize quantization loss.
-
-        ┌──────────────────────────────────────────────────┐
-        │        Input: layer.weight ∈ [O, I]              |
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 1: Reshape to groups                       │
-        │  weight_grouped ∈ [O, G, group_size]             │
-        │  where G = I // group_size                       │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 2: Normalize each group                    │
-        │  w_scaled = |w| / max(|w|_group) ∈ [O, G, group] │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 3: Restore shape and aggregate             │
-        │  w_scaled.view(O, I)                             │
-        │  w_mean ∈ [O] ← mean over input_dim              │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 4: Compute input mean                      │
-        │  x_mean ∈ [I] ← chunked abs mean                 │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 5: Forward Pass                            │
-        │  fp16_output = layer(inp)                        │
-        └──────────────────────────────────────────────────┘
-                                │
-                                ▼
-        ┌──────────────────────────────────────────────────┐
-        │  Step 6: Optimize Scales                         │
-        │  best_scales = _compute_best_scale(...) ∈ [O]    │
-        └──────────────────────────────────────────────────┘
-
         Returns:
             Tuple of:
             - Previous op name (str)
             - Target layer name (tuple of one str)
             - Computed scale tensor: [out_features] (float16 or bfloat16)
+
+        * Mathematical Steps:
+        - Grouped Weight Normalization:
+            w_grouped = weight.view(O, G, group_size)
+            w_scaled = |w_grouped| / max(|w_grouped|)  → [0, 1] within each group
+            w_mean = mean(w_scaled, dim=-1) → [out_features, num_groups]
+        - Input Mean (chunked, per group):
+            x_mean = mean(abs(x[:, group]), dim=0).mean() → one value per group
+        - Final:
+            best_scales[:, g] = _compute_best_scale(x_group, w_mean[:, g], x_mean[g], ...)
+
+        * WORKFLOW:
+        1. Weight Grouping:
+            - Split weights into groups of `group_size` along the input dimension.
+            - Normalize each group:  w_scaled = |W| / max(|W|_group)
+            - Compute mean(|W|_group) per output → `w_mean ∈ [O, G]`
+
+        2. Input Mean Calculation:
+            - Compute per-group input activation mean → `x_mean ∈ [G]`
+            - Broadcast to all output channels → `x_mean_broadcasted ∈ [O, G]`
+
+        3. Forward Pass:
+            - Forward the full input through the inspected layer to obtain `fp16_output ∈ [B, O]`
+
+        4. Optimize Scale:
+            - For each group g:
+                - Pass x_group and corresponding w_group into _compute_best_scale()
+                - Get one scale per output channel: `s ∈ [O]`
+                - Store into `scales[:, g]`
+
+        ┌────────────────────────────────────────────────────┐
+        │        Input: layer.weight ∈ [O, I]                │
+        └────────────────────────────────────────────────────┘
+                                │
+                                ▼
+        ┌────────────────────────────────────────────────────┐
+        │  Step 1: Group and normalize weights               │
+        │  w_scaled ∈ [O, G, group_size]                     │
+        │  w_mean ∈ [O, G] ← mean(|w_grouped|)               │
+        └────────────────────────────────────────────────────┘
+                                │
+                                ▼
+        ┌────────────────────────────────────────────────────┐
+        │  Step 2: Compute input means per group             │
+        │  x_mean ∈ [G] → broadcast → [O, G]                 │
+        └────────────────────────────────────────────────────┘
+                                │
+                                ▼
+        ┌────────────────────────────────────────────────────┐
+        │  Step 3: Forward pass (original fp16 layer)        │
+        │  fp16_output ∈ [B, O]                              │
+        └────────────────────────────────────────────────────┘
+                                │
+                                ▼
+        ┌────────────────────────────────────────────────────┐
+        │  Step 4: Optimize scales per group                 │
+        │  scales[:, g] = _compute_best_scale(...) ∈ [O]     │
+        └────────────────────────────────────────────────────┘
+
         """
         layer_name = get_op_name(module, layer)
         module2inspect = module2inspect or layer
@@ -766,11 +763,11 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         # --- STEP 1: Compute grouped weight mean ---
         try:
-            weight = layer.weight.detach()
-            out_features, in_features = weight.shape
+            weight = layer.weight.detach()  # create a copy of the weights
+            out_features, in_features = weight.shape  # get dim (for reshaping)
 
-            if self.group_size <= 0:
-                raise ValueError("group_size must be > 0 for group quantization.")
+            # if self.group_size <= 0:
+            #     raise ValueError("group_size must be > 0 for group quantization.")
 
             if in_features % self.group_size != 0:
                 raise ValueError(
@@ -778,40 +775,94 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 )
 
             num_groups = in_features // self.group_size
-            weight_grouped = weight.view(out_features, num_groups, self.group_size)
+            weight_grouped = weight.view(
+                out_features, num_groups, self.group_size
+            )  # * Reshape weights
 
-            w_max = weight_grouped.abs().amax(dim=-1, keepdim=True) + 1e-6
-            w_scaled = weight_grouped.abs() / w_max
-            w_scaled_restored = w_scaled.view(out_features, in_features)
-            w_mean = w_scaled_restored.mean(dim=1)  # [out_features]
+            # Logging for debug
+            logger.info(f"weight shape = {weight.shape}")
+            logger.info(f"num_groups: {num_groups}")
+            logger.info(f"[{layer_name}] weight_grouped shape: {weight_grouped.shape}")
+            logger.info(
+                f"[{layer_name}] weight_grouped preview [:3, 0, :5]: {weight_grouped[:3, 0, :5].tolist()}"
+            )
 
-            logger.debug(f"[{layer_name}] w_mean.shape = {w_mean.shape}")
+            # todo: commented out; delete after debugging
+            # # Group-wise normalized weights
+            # w_max = weight_grouped.abs().amax(dim=-1, keepdim=True) + 1e-6
+            # w_scaled = weight_grouped.abs() / w_max
+            # w_mean = w_scaled.mean(
+            #     dim=-1
+            # )  #! shape: [O, G] (in Torch, row: output/col: input)
+            # # w_mean: Average weight magnitude per output group (all groups)
 
+            # logger.debug(f"[{layer_name}] w_mean.shape (group-wise) = {w_mean.shape}")
+
+            # Clear weight_grouped to save memory
             clear_memory(weight_grouped)
 
         except Exception as e:
             logger.error(f"[{layer_name}] Error during weight scale computation: {e}")
             raise
 
-        # --- STEP 2: Compute input activation mean (chunked) ---
+        # --- STEP 2: Compute input mean (per input channel), chunked to avoid OOM
         try:
             inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])
             num_elements = inp_flat.size(0)
             num_channels = inp_flat.size(1)
-            element_size_bytes = inp_flat.element_size() * 2  # FP32 size
-
-            chunk_size = self.max_chunk_memory // (element_size_bytes * num_channels)
-            chunk_size = min(chunk_size, num_elements)
+            chunk_size = min(
+                self.max_chunk_memory // (inp_flat.element_size() * 2 * num_channels),
+                num_elements,
+            )
 
             x_sum = torch.zeros(num_channels, dtype=torch.float32)
             for i in range(0, num_elements, chunk_size):
                 end = min(i + chunk_size, num_elements)
-                chunk_sum = inp_flat[i:end].to(torch.float32).sum(dim=0)
-                x_sum += chunk_sum.to("cpu")  # device-safe addition
+                x_sum += inp_flat[i:end].to(torch.float32).sum(dim=0)
 
-            x_mean = (x_sum / num_elements).to(inp.dtype)
+                # todo: delete later
+                # chunk_sum = inp_flat[i:end].to(torch.float32).sum(dim=0)
+                # x_sum += chunk_sum.to("cpu")  # device-safe addition
 
-            logger.debug(f"[{layer_name}] x_mean.shape = {x_mean.shape}")
+            # todo: commented out b/c doing it in the loop; delete later
+            # x_mean = (x_sum / num_elements).to(inp.dtype)
+            # clear_memory()
+
+            # # Project x_mean to output channels → then regroup
+            # x_mean = x_mean.to(weight.device)  # Move to cpu for calculation
+
+            # Project input activation mean into output channels
+            x_mean_flat = (
+                (x_sum / num_elements).to(inp.dtype).to(weight.device)
+            )  # [in_features]
+            x_mean_grouped = x_mean_flat.view(num_groups, self.group_size).mean(
+                dim=1
+            )  # [num_groups]
+            x_mean_broadcasted = x_mean_grouped.expand(
+                out_features, -1
+            ).contiguous()  # [O, G]
+
+            logger.info(
+                f"[{layer_name}] x_mean_grouped shape = {x_mean_broadcasted.shape}"
+            )
+            logger.info(
+                f"[{layer_name}] weight_grouped preview [:3, 0, :3]: {x_mean_broadcasted[:3, :3].tolist()}"
+            )
+
+            # todo: commented out; delete later
+            # x_mean_flat = inp.cpu().abs().view(-1, inp.shape[-1])  # -> [*, in_features]
+            # x_mean = x_mean_flat.mean(dim=0)  # -> [in_features]
+            # x_mean_grouped_raw = x_mean.view(num_groups, self.group_size).mean(
+            #     dim=1
+            # )  # -> like [12]
+            # x_mean_grouped = x_mean_grouped_raw.expand(
+            #     out_features, -1
+            # ).contiguous()  # -> regroup to 2-dim, like [1536, 12]
+            # # x_mean_grouped: Approximate average input signal per output group (all groups)
+
+            # logger.debug(
+            #     f"[{layer_name}] x_mean.shape (group-wise) = {x_mean_grouped.shape}"
+            # )
 
             clear_memory(x_sum)
 
@@ -819,43 +870,251 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.error(f"[{layer_name}] Error during input mean computation: {e}")
             raise
 
+        log_gpu_usage("[fp16_output] BEFORE forward pass")  # ⬅️ VRAM logging
+
         # --- STEP 3: Forward pass for FP16 output ---
         try:
             module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
             fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
+
+            log_gpu_usage("[fp16_output] AFTER forward pass")  # ⬅️ VRAM logging
+
             fp16_output = fp16_output.clip(
                 torch.finfo(fp16_output.dtype).min,
                 torch.finfo(fp16_output.dtype).max,
             )
+            fp16_output = fp16_output.to("cpu")
+            torch.cuda.empty_cache()
+
+            # VRAM logging
+            log_gpu_usage("[DEBUG] After fp16_output moved + cleared")  # ⬅️ VRAM logging
+            resource_logger.debug(
+                f"Is model still on GPU? {[n.device for n in module2inspect.parameters()]}"
+            )
+            resource_logger.debug(f"Is inp still on GPU? {inp.device}")
+
         except Exception as e:
             logger.error(f"[{layer_name}] Forward pass failed: {e}")
             raise
 
         # --- STEP 4: Optimize scale using loss search ---
-        try:
-            best_scales = self._compute_best_scale(
-                inp,
-                w_mean,
-                x_mean,
-                module2inspect,
-                [layer],
-                fp16_output,
-                module_kwargs,
-            )
-            logger.debug(f"[{layer_name}] best_scales.shape = {best_scales.shape}")
-        except Exception as e:
-            logger.error(f"[{layer_name}] Failed to compute best scale: {e}")
-            raise
+        # Compute best scale via grid search
 
-        # --- Cleanup ---
+        # Prepare the final scale tensor
+        scales = torch.zeros(
+            (layer.out_features, num_groups), dtype=torch.float16
+        )  # setup holder
+        self.duo_scaling = True  # ! include both w_mean and x_mean
+
+        # iterate over each group
+        for g in range(num_groups):
+            start, end = g * self.group_size, (g + 1) * self.group_size
+
+            # Slice inputs and weights for the group
+            x_per_group = inp[
+                :, :, start:end
+            ]  # ☑️ slicing in_features[B, sequence, group_size]
+
+            # todo: debug; delete later
+            if torch.isnan(x_per_group).any():
+                logger.error(
+                    f"[{layer_name}] Group {g} input (x_per_group) contains NaNs!"
+                )
+                raise ValueError("NaNs in input tensor during calibration.")
+            logger.info(f"x_per_group shape == {x_per_group.shape}")
+
+            w_per_group = layer.weight[:, start:end]  # i.e., [1536, 128]
+
+            # Slice x_mean and compute group mean per input feature group
+            # x_mean = x_group.abs().mean(dim=0)  # [B, group_size]
+            # x_mean_grouped = x_mean.mean().expand(layer.out_features)  # [O, group_size]
+
+            # Group-wise input activation average, broadcast per output channel
+            x_per_group_mean = (
+                x_per_group.abs().mean(dim=0).mean().expand(out_features)
+            )  # [O]
+            w_per_group_max = w_per_group.abs().amax(dim=1, keepdim=True) + 1e-6
+            w_per_group_scaled = w_per_group.abs() / w_per_group_max
+            w_per_group_mean = w_per_group_scaled.mean(dim=1)  # [O]
+
+            # Log VRAM utilization
+            log_gpu_usage(f"[{layer_name}] Group {g}: before scale search")
+
+            # Call your per-group scale search
+            best_scale_per_group = self._compute_best_scale_groupwise(
+                x=inp,  # full input
+                w_mean=w_per_group_mean,  # per group only
+                x_mean=x_per_group_mean,  # per group only
+                module2inspect=layer,  # full layer (layer for pass forward)
+                linears2scale=[layer],  # full layer (layer to calib scales)
+                fp16_output=fp16_output,  # full layer output
+                group_idx=g,
+                group_size=self.group_size,
+                kwargs=module_kwargs,
+            )
+
+            # Log VRAM utilization
+            log_gpu_usage(f"[{layer_name}] Group {g}: after scale search")
+
+            scales[:, g] = best_scale_per_group
+            logger.debug(
+                f"[{layer_name}] Group {g}: shape={best_scale_per_group.shape}, "
+                f"mean={best_scale_per_group.mean():.4f}, std={best_scale_per_group.std():.4f}"
+            )
+            logger.debug(
+                f"[{layer_name}] Group {g} scale preview: {best_scale_per_group[:5].tolist()}"
+            )
+
+        # Logging and shape check
+        logger.debug(
+            f"[{get_op_name(module, layer)}] best_scales shape: {scales.shape}"
+        )
+        logger.debug(
+            f"[{get_op_name(module, layer)}] best_scales preview:\n{scales[:3, :]}"
+        )
+
+        assert scales.shape == (out_features, num_groups), (
+            f"[{layer_name}] Expected best_scales shape {[out_features, num_groups]}, "
+            f"got {scales.shape}"
+        )
+
         del inp, fp16_output
         clear_memory()
 
-        return (
-            get_op_name(module, prev_op),
-            (layer_name,),
-            best_scales,
-        )
+        return get_op_name(module, prev_op), (layer_name,), scales
+
+    def _compute_best_scale_groupwise(
+        self,
+        x: torch.Tensor,
+        w_mean: torch.Tensor,
+        x_mean: torch.Tensor,
+        module2inspect: torch.nn.Module,
+        linears2scale: List[nn.Linear],
+        fp16_output: torch.Tensor,
+        group_idx: int,  # ✔️ Added to autoawq code
+        group_size: int,  # ✔️ Added to autoawq code
+        kwargs: Dict = {},
+    ):
+        """
+        * Replace official autoawq's _compute_best_scale method to accomodate
+        * per group calculation efficiently.
+
+        Compute loss and select best scales
+
+        L(s) = || Q(W * s) (s^-1 * X) - W * X ||
+        Q: weight quantization function | pseudo_quantize_tensor(W * s)
+        X: inputs from calib dataset    | X
+        W: original weights in FP16     | layer
+        s: per channel scaling factor   | s^-1 * X
+
+        Grid search to find the best quantization scale for a specific input group.
+
+        This method evaluates candidate scales for a single input group (specified
+        by `group_idx`) by temporarily modifying the corresponding slice of weight
+        matrices in `linears2scale`. The modified layer(s) are then used in a forward
+        pass to compute the quantized output, which is compared against the original
+        FP16 output to compute reconstruction loss.
+
+        Args:
+            x (torch.Tensor): Full input tensor to the layer (shape: [B, in_features]).
+            w_mean (torch.Tensor): Per-output-channel mean of normalized weights
+                for this group (shape: [out_features]).
+            x_mean (torch.Tensor): Scalar input mean for this group, broadcasted
+                per output channel (shape: [out_features]).
+            module2inspect (nn.Module): The module to forward for computing
+                the quantized output.
+                Typically a single Linear layer, but can also be a higher-level container.
+            linears2scale (List[nn.Linear]): List of Linear layers in which the scale
+                should be applied.
+                Usually contains a single layer.
+            fp16_output (torch.Tensor): Original output of the unquantized full layer
+                (shape: [B, out_features]), used as the target for loss comparison.
+            group_idx (int): Index of the input group currently being quantized.
+            group_size (int): Number of input dimensions in each group.
+            kwargs (Dict, optional): Additional keyword arguments passed to the module's
+                forward method (e.g., attention masks). Defaults to empty.
+
+        Returns:
+            torch.Tensor: Optimal scale vector for this group, per output channel
+            (shape: [out_features]).
+        """
+        start = group_idx * group_size
+        end = (group_idx + 1) * group_size
+
+        n_grid = 20
+        history = []
+        best_ratio = -1
+        best_scales = None
+        best_error = float("inf")
+
+        org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+
+        device = x.device
+        x_mean = x_mean.view(-1).to(device)
+        w_mean = w_mean.view(-1).to(device)
+
+        assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"  # extra guard
+        assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"  # extra guard
+
+        for ratio in range(n_grid):
+            # create new scales
+            ratio = ratio / n_grid
+
+            # NOTE: s^-1 * x is fused here, according to paper
+            if self.duo_scaling:
+                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
+                    min=1e-4
+                )
+            else:
+                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+            scales = scales / (scales.max() * scales.min()).sqrt()
+            scales_view = scales.view(-1, 1).to(
+                device
+            )  # ☑️ updated: flip dim to broadcast across num of groups input dims
+
+            # avoid scaling values that overflow
+            scales[torch.isinf(scales)] = 1
+            scales[torch.isnan(scales)] = 1
+
+            # Q(W * s)
+            for fc in linears2scale:
+                fc.weight[:, start:end].mul_(scales_view)  # ☑️ updated to slice weights
+                fc.weight.data[:, start:end] = (
+                    self.pseudo_quantize_tensor(fc.weight.data[:, start:end])[0]
+                    / scales_view
+                )  # ☑️ updated to slice weights
+                logger.debug(f"Group {group_idx}: scale shape = {scales_view.shape}")
+
+            # W * X
+            int_w_output = self._module_forward(x, module2inspect, kwargs)
+            int_w_output = int_w_output.clip(
+                torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max
+            )  # clamp
+            int_w_output = int_w_output.to(
+                "cpu"
+            )  # ☑️ Added to bring to same device as fp16_output
+
+            # compute mean squared error (L2 norm)
+            loss = self._compute_loss(fp16_output, int_w_output, device)
+
+            history.append(loss)
+            if loss < best_error:
+                best_error = loss
+                best_ratio = ratio
+                best_scales = scales.clone()
+                logger.debug(
+                    f"[Group {group_idx}] New best ratio = {ratio:.3f}, loss = {loss:.6f}"
+                )
+            module2inspect.load_state_dict(org_sd)
+
+        if best_ratio == -1:
+            logger.error(f"No valid scale found for group. Loss history: {history}")
+            raise Exception
+
+        assert best_scales is not None  # Add extra guard
+        assert torch.isnan(best_scales).sum() == 0, best_scales
+
+        return best_scales.detach().cpu()
 
     @override
     @torch.no_grad()
@@ -1109,7 +1368,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     best_scales = best_scales.to(device)
                     scales_dict[layer_name] = best_scales
                     logger.debug(
-                        f"[scales.raw] {layer_name} → shape: {best_scales.shape}, preview: {best_scales[:5].tolist()}"
+                        f"[raw scales] {layer_name} → shape: {best_scales.shape}, preview: {best_scales[:5].tolist()}"
                     )
 
                 # 2. Normalize scales across the group
@@ -1120,7 +1379,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 )
                 for name, scale_tensor in list(normalized_scales.items()):
                     logger.debug(
-                        f"[scales.norm] {name} → shape: {scale_tensor.shape}, preview: {scale_tensor[:5].tolist()}"
+                        f"[normalized scales] {name} → shape: {scale_tensor.shape}, preview: {scale_tensor[:5].tolist()}"
                     )
 
                 # 3. Apply scale, compute zeros, clip, quantize

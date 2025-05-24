@@ -69,7 +69,7 @@ def normalize_scales_across_group(
 
         # Ensure that scale is 1D of length out_features
         assert (
-            weight.shape[0] == scale.shape[0]
+            weight.shape[0] == scale.shape[1]
         ), f"Mismatch: weight={weight.shape}, scale={scale.shape}"
         assert scale.dim() == 1
         assert scale.shape[0] == weight.shape[0]

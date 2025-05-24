@@ -94,7 +94,7 @@ def scrooge_quant_pipeline(
     base_model: Optional[str] = None,
     save_dir_path: Optional[str] = None,
     max_calib_samples: int = 96,
-    max_calib_seq_len: int = 1024,
+    max_calib_seq_len: int = 512,  # ! do not set this high
     apply_clip: bool = True,
     quant_config: Optional[Dict] = None,
     w_bit: int = 4,
