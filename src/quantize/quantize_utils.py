@@ -311,34 +311,69 @@ def load_quantized_layers_into_model(
     return model
 
 
-def persist_quantized_layer(module: nn.Module, save_dir: str) -> None:
+import os
+import torch
+import logging
+from typing import Optional
+from awq.modules.linear.gemm import WQLinear_GEMM
+
+logger = logging.getLogger(__name__)
+
+
+def persist_quantized_layer(
+    quant_layer: WQLinear_GEMM,
+    save_dir: str,
+    module_name: str,
+    sub_layer_name: str,
+) -> Optional[str]:
     """
-    Persist quantized layers to disk using full dot-path names.
+    Save a single quantized WQLinear_GEMM layer to disk with a hierarchical name.
 
     Args:
-        module (nn.Module): The quantized model (containing WQLinear_GEMM layers).
-        save_dir (str): Directory to save the quantized layer files.
+        quant_layer (WQLinear_GEMM): The quantized linear layer.
+        save_dir (str): Directory to save the quantized weights.
+        module_name (str): Parent module name (e.g., "model.layers.5").
+        sub_layer_name (str): Sub-layer name (e.g., "self_attn.q_proj").
 
     Returns:
-        None
+        Optional[str]: Path to the saved file, or None if saving failed.
+
+    Example:
+    >>>    persist_quantized_layer(
+    >>>        quant_layer=quantized_layer,
+    >>>        save_dir=save_dir_path,
+    >>>        module_name=f"model.layers.{idx}",
+    >>>        sub_layer_name=layer_name
+    >>>    )
     """
-    os.makedirs(save_dir, exist_ok=True)
+    try:
+        if not isinstance(quant_layer, WQLinear_GEMM):
+            raise TypeError(f"Expected WQLinear_GEMM, got {type(quant_layer)}")
 
-    for module_name, sub_module in module.named_modules():
-        if isinstance(sub_module, WQLinear_GEMM):
-            file_path = os.path.join(save_dir, f"{module_name}.pt")
+        os.makedirs(save_dir, exist_ok=True)
 
-            quant_data = {
-                "qweight": sub_module.qweight.clone().cpu(),
-                "qzeros": sub_module.qzeros.clone().cpu(),
-                "scales": sub_module.scales.clone().cpu(),
-            }
+        full_name = f"{module_name}.{sub_layer_name}"
+        file_path = os.path.join(save_dir, f"{full_name}.pt")
 
-            if sub_module.bias is not None:
-                quant_data["bias"] = sub_module.bias.clone().cpu()
+        quant_data = {
+            "qweight": quant_layer.qweight.clone().cpu(),
+            "qzeros": quant_layer.qzeros.clone().cpu(),
+            "scales": quant_layer.scales.clone().cpu(),
+        }
 
-            torch.save(quant_data, file_path)
-            print(f"Persisted {module_name} to {file_path}")
+        if quant_layer.bias is not None:
+            quant_data["bias"] = quant_layer.bias.clone().cpu()
+
+        torch.save(quant_data, file_path)
+        logger.info(f"✅ Saved quantized layer: {file_path}")
+        return file_path
+
+    except Exception as e:
+        logger.error(
+            f"❌ Failed to save quantized layer '{module_name}.{sub_layer_name}': {e}",
+            exc_info=True,
+        )
+        return None
 
 
 def unwrap_to_transformer(model: nn.Module) -> nn.Module:

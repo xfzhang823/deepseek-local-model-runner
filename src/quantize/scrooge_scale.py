@@ -37,74 +37,78 @@ allowed_act_fns = [
 ]
 
 
-def normalize_scales_across_group(
-    layers: List[nn.Linear],
-    name_to_layer: Dict[nn.Linear, str],
+import torch
+import torch.nn as nn
+from typing import Dict, List, Union
+
+
+def normalize_scales_across_groups(
+    layers: List[Union[nn.Linear, Tuple[nn.Linear, slice]]],
+    name_to_layer: Dict[Union[nn.Linear, Tuple[nn.Linear, slice]], str],
     scales_dict: Dict[str, torch.Tensor],
     epsilon: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """
-    Normalize per-layer scales across a group so that all resulting scaled weights
-    have the same maximum dynamic range.
-
-    This ensures that after applying the normalized scales:
-        max(abs(weight / scale)) == shared_max (for all layers)
+    Normalize group-wise scales across Q/K/V projections that share input.
+    Supports both:
+    - Separate layers (each scale is [O, G])
+    - Fused layers using weight slices (e.g., query_key_value), scale sliced accordingly.
 
     Args:
-        layers: List of nn.Linear layers in the group
-        name_to_layer: Mapping from layer instance to its string name
-        scales_dict: Dictionary of layer_name → best_scales (1D tensor per layer)
-        epsilon: Small value to avoid division by zero
+        layers: List of nn.Linear layers or (layer, slice) for fused QKV
+        name_to_layer: Dict mapping layer or (layer, slice) → name
+        scales_dict: Dict name → scale tensor (shape [O, G])
+        epsilon: Small constant for numerical stability
+        group_size: Number of input dims per group
 
     Returns:
-        Updated scales_dict with normalized per-channel scale tensors
+        Updated scales_dict with normalized scales
     """
-    per_layer_maxes = {}
+    per_group_max = {}
 
-    # Step 1: Compute max(abs(weight / scale)) for each layer
-    for layer in layers:
-        name = name_to_layer[layer]
-        weight = layer.weight.detach()
+    for entry in layers:
+        name = name_to_layer[entry]
+
+        if isinstance(entry, tuple):
+            layer, sl = entry
+            weight = layer.weight.detach()[sl]  # [O, I]
+            scale = scales_dict[name]
+        else:
+            layer = entry
+            weight = layer.weight.detach()  # [O, I]
+            scale = scales_dict[name]
+
+        assert scale.dim() == 2, f"{name} must be 2D [O, G], got {scale.shape}"
+        O, I = weight.shape
+        G = scale.shape[1]
+        assert I % G == 0, f"Invalid group size: in_features={I}, groups={G}"
+        gsize = I // G
+
+        per_group_max[name] = []
+        for g in range(G):
+            w = weight[:, g * gsize : (g + 1) * gsize]
+            s = scale[:, g].view(-1, 1)
+            max_val = (w / (s + epsilon)).abs().max().item()
+            per_group_max[name].append(max_val)
+
+    # Step 2: For each group index, get shared max across layers
+    G = len(next(iter(per_group_max.values())))
+    shared_max = [
+        max(per_group_max[name][g] for name in per_group_max) for g in range(G)
+    ]
+
+    # Step 3: Normalize each layer's scale
+    for entry in layers:
+        name = name_to_layer[entry]
         scale = scales_dict[name]
+        current_max = per_group_max[name]
 
-        # Ensure that scale is 1D of length out_features
-        assert (
-            weight.shape[0] == scale.shape[1]
-        ), f"Mismatch: weight={weight.shape}, scale={scale.shape}"
-        assert scale.dim() == 1
-        assert scale.shape[0] == weight.shape[0]
+        normed = torch.empty_like(scale)
+        for g in range(G):
+            ratio = current_max[g] / (shared_max[g] + epsilon)
+            normed[:, g] = scale[:, g] * ratio
 
-        # Broadcast scale to match weight shape: [out, in]
-        logger.debug(f"{name}: weight {weight.shape}, scale {scale.shape}")
-
-        scaled_weight = weight / (scale.view(-1, 1) + epsilon)
-
-        logger.debug(
-            f"[normalize] {name} → weight: {weight.shape}, scale: {scale.shape}"
-        )
-
-        per_layer_maxes[name] = scaled_weight.abs().max().item()
-
-    # Step 2: Find shared maximum across the group
-    shared_max = max(per_layer_maxes.values())
-    logger.debug(f"Shared max across group: {shared_max:.6f}")
-
-    # Step 3: Normalize each layer's scales
-    for layer in layers:
-        name = name_to_layer[layer]
-        original_scale = scales_dict[name]
-        current_max = per_layer_maxes[name]
-
-        ratio = current_max / (shared_max + epsilon)
-        normalized_scale = original_scale * ratio
-
-        logger.debug(
-            f"[{name}] current_max={current_max:.6f}, "
-            f"ratio={ratio:.6f}, "
-            f"scale preview={normalized_scale[:5].tolist()}"
-        )
-
-        scales_dict[name] = normalized_scale
+        scales_dict[name] = normed
 
     return scales_dict
 
@@ -143,97 +147,68 @@ def scale_ln_fc(fc_layer: nn.Linear, scales: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-def apply_scale(
-    module: nn.Module,
-    scales_list: List[Tuple[str, Tuple[str], torch.Tensor]],
-    input_feat_dict: Optional[Dict[str, torch.Tensor]] = None,
-) -> None:
+def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
     """
-    * Modified from standard code in scale.py
+    Applies group-wise scaling to a Linear layer's weights in-place.
 
-    Applies computed per-layer scales in-place to the model.
-
-    Handles 3 connection patterns:
-      1. Linear -> Linear
-      2. Norm    -> Linear
-      3. ActFn   -> Linear
-
-    ---
-    ASCII Diagram:
-        ┌────────────┐     scale      ┌────────────┐
-        │ prev_op    │ ────────────▶ │ Linear     │
-        └────────────┘                └────────────┘
+    This function assumes that the input dimension of the layer is divided into
+    equal-sized groups (e.g., group_size = in_features // num_groups), and that
+    each group has a corresponding scale per output channel.
 
     Args:
-        module (nn.Module): The top-level container.
-        scales_list (List[Tuple]): Each tuple contains:
-            - prev_op_name: str
-            - (layer_name,): single-element tuple
-            - scales: Tensor ∈ [out_features]
-        input_feat_dict (Optional[Dict[str, Tensor]]): If provided, also scale
-            input activations.
+        layer (nn.Linear): The Linear layer whose weights will be modified.
+        scales (torch.Tensor): A 2D tensor of shape [out_features, num_groups],
+            where each entry scales a corresponding group of input weights.
+
+    Behavior:
+        For each group g:
+            - Scales the weight slice [:, g_start:g_end] by scales[:, g]
+            - Modifies layer.weight.data in-place
 
     Raises:
-        NotImplementedError: If the pattern is unsupported.
-        AssertionError: If layer isn't an nn.Linear or tuple length is not 1.
+        AssertionError: If scale dimensions do not align with the layer's weight shape.
     """
+    try:
+        weight = layer.weight.data
+        O, I = weight.shape
 
-    for prev_op_name, layer_names, scales in scales_list:
-        assert len(layer_names) == 1, "Expected one target layer per scale tuple"
-        layer_name = layer_names[0]
-
-        prev_op = get_op_by_name(module, prev_op_name)
-        layer = get_op_by_name(module, layer_name)
-
-        assert isinstance(layer, nn.Linear), f"{layer_name} is not nn.Linear"
-
-        best_device = get_best_device()
-        prev_op.to(best_device)
-        layer.to(best_device)
-        scales = scales.to(best_device)
-
-        logger.info(f"[apply_scale] Applying scale to {layer_name}")
-        logger.debug(f"  - prev_op: {prev_op_name} ({type(prev_op).__name__})")
-        logger.debug(f"  - scale.shape = {scales.shape}")
-        logger.debug(f"  - weight.shape = {layer.weight.shape}")
-        logger.debug(f"  - scale preview: {scales[:5].tolist()}")
-
-        # Case 1: Linear -> Linear
-        if isinstance(prev_op, nn.Linear):
-            scale_fc_fc(prev_op, layer, scales)
-            logger.debug(f"  - Pattern: Linear → Linear")
-
-        # Case 2: Norm -> Linear
-        elif (
-            any(isinstance(prev_op, t) for t in allowed_norms)
-            or "rmsnorm" in str(prev_op.__class__).lower()
-        ):
-            scale_ln_fc(layer, scales)
-            logger.debug(f"  - Pattern: Norm → Linear")
-
-        # Case 3: Activation -> Linear
-        elif any(isinstance(prev_op, t) for t in allowed_act_fns):
-            new_module = ScaledActivation(prev_op, scales)
-            set_op_by_name(module, prev_op_name, new_module)
-            scale_gelu_fc(prev_op, layer, scales)
-            logger.debug(f"  - Pattern: Activation → Linear")
-
-        else:
-            raise NotImplementedError(
-                f"Unsupported prev_op: {type(prev_op)}. "
-                f"Allowed: Linear, {[t.__name__ for t in allowed_norms]}, "
-                f"{[t.__name__ for t in allowed_act_fns]}"
+        if scales.dim() != 2:
+            raise ValueError(
+                f"Expected scales to be 2D [out_features, num_groups], got {scales.shape}"
             )
 
-        if input_feat_dict and layer_name in input_feat_dict:
-            inp = input_feat_dict[layer_name]
-            inp.div_(scales.view(1, -1).to(inp.device))
-            logger.debug(f"  - Scaled input_feat[{layer_name}] in-place")
+        S_O, G = scales.shape
+        if O != S_O:
+            raise ValueError(
+                f"Mismatch: weight.out_features={O}, but scales.shape[0]={S_O}"
+            )
 
-        prev_op.cpu()
-        layer.cpu()
-        scales.cpu()
-        logger.debug(f"  - Devices released (moved to CPU)")
+        if I % G != 0:
+            raise ValueError(
+                f"Incompatible group size: in_features={I}, num_groups={G} → not divisible"
+            )
+
+        group_size = I // G
+        logger.debug(
+            f"[scale_weights_by_group] layer={layer.__class__.__name__}, "
+            f"weight.shape={weight.shape}, scale.shape={scales.shape}, "
+            f"group_size={group_size}, num_groups={G}"
+        )
+
+        for g in range(G):
+            start = g * group_size
+            end = (g + 1) * group_size
+            s = scales[:, g].view(-1, 1)  # [O, 1]
+            weight[:, start:end].mul_(s)
+
+        logger.info(
+            f"[scale_weights_by_group] Successfully applied group-wise scale: "
+            f"{G} groups × {O} output neurons"
+        )
+
+    except Exception as e:
+        logger.error(f"[scale_weights_by_group] Failed to apply scaling: {e}")
+        raise
 
 
 @torch.no_grad()

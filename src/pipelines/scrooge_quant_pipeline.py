@@ -14,14 +14,18 @@ import psutil
 from awq import AutoAWQForCausalLM
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
+
+# From project modules
 from quantize.scrooge_awq_quantizer import (
     ScroogeAwqQuantizer,
     # persist_awq_quantized_model,
 )
 from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR
+from utils.vram_tracker import monitor_vram, VRAMMonitor
 import logging_config  # assuming this sets up logging globally
 
 logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 # Load global config variables
@@ -29,7 +33,7 @@ BASE_MODEL = os.getenv(
     "MODEL_NAME_HF"
 )  # Example: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
-OUT_DIR = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR / "quantized_layers$")
+OUT_DIR = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR / "quantized_layers")
 
 if BASE_MODEL is None:
     raise ValueError("Environment variable MODEL_NAME_HF must be set.")
@@ -52,9 +56,6 @@ def log_resource_snapshot(tag: str = "RESOURCE") -> None:
     """
     Log CPU, RAM, and GPU memory usage under the 'resource' logger.
     """
-    import logging
-    import psutil
-    import torch
 
     resource_logger = logging.getLogger("resource")
 
@@ -90,7 +91,7 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
-def scrooge_quant_pipeline(
+def run_scrooge_quant_pipeline(
     base_model: Optional[str] = None,
     save_dir_path: Optional[str] = None,
     max_calib_samples: int = 96,
@@ -113,7 +114,19 @@ def scrooge_quant_pipeline(
             "❌ 'base_model' is not set. Please provide a model name or set the MODEL_NAME_HF environment variable."
         )
 
-    save_dir_path = str(Path(save_dir_path or OUT_DIR).expanduser().resolve())
+    # Normalize and resolve the save directory path
+    raw_path = save_dir_path or OUT_DIR
+    save_dir_path = str(Path(raw_path).expanduser().resolve(strict=False))
+    logger.info(f"📁 Checking save directory: {save_dir_path}")
+
+    # Proactively create or fail
+    if os.path.exists(save_dir_path) and not os.path.isdir(save_dir_path):
+        raise NotADirectoryError(
+            f"❌ Path exists but is not a directory: {save_dir_path}"
+        )
+
+    os.makedirs(save_dir_path, exist_ok=True)
+    logger.info(f"✅ Save directory is ready: {save_dir_path}")
 
     quant_config = quant_config or {
         "w_bit": w_bit,
@@ -139,19 +152,17 @@ def scrooge_quant_pipeline(
         save_dir=save_dir_path,
     )
 
-    calib_stats_path = os.path.join(save_dir_path, "calib_stats.pt")
+    # ✅ Wrap with automatic VRAM monitor
+    with monitor_vram(interval=2) as monitor:  # logging every 2 seconds
+        logger.info("📊 Running calibration & quantization...")
 
-    if not os.path.exists(calib_stats_path):
-        logger.info("📊 Running calibration + quantization...")
-        log_resource_snapshot("BEFORE_CALIBRATION")
+        log_resource_snapshot("Before calibration & quantization")
         quantizer.calibrate_and_quantize(save_dir_path=save_dir_path)
-        log_resource_snapshot("AFTER_CALIBRATION")
+        log_resource_snapshot("After calibration & quantization")
 
-    else:
-        logger.info("📎 Skipping calibration (already exists). Loading stats...")
-        quantizer.load_calibration_stats(calib_stats_path)
-        quantizer.quant_with_calib_scales()
-        log_resource_snapshot("AFTER_QUANT_ONLY")
+    # VRAM logging
+    peak_vram = monitor_vram.get_peak_vram()
+    logger.info(f"📈 Peak VRAM usage during quantization: {peak_vram:.2f} MB")
 
     logger.info("💾 Saving quantized model and config...")
     quantizer.save_quantized_and_configs(save_dir=save_dir_path)
