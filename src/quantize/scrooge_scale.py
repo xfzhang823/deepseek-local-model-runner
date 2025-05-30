@@ -4,6 +4,7 @@
 Custom version of the official code to apply scales to a single layer.
 """
 
+import re
 import logging
 from typing import List, Tuple, Optional, Dict, cast
 import torch
@@ -172,6 +173,8 @@ def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
         weight = layer.weight.data
         O, I = weight.shape
 
+        scales = scales.to(weight.device)  # ensures scales are on GPU
+
         if scales.dim() != 2:
             raise ValueError(
                 f"Expected scales to be 2D [out_features, num_groups], got {scales.shape}"
@@ -219,38 +222,46 @@ def apply_clip(
 ) -> None:
     """
     Apply symmetric clipping to a Linear layer's weights.
-
-    Clipping is only applied if `clip_value` is not None.
-
-    ---
-    Operation:
-        weight[:] = clamp(weight[:], -clip_value, +clip_value)
+    If layer_name is a global name, this auto-strips to relative.
 
     Args:
         module (nn.Module): Parent module containing the layer.
-        layer_name (str): Name of the layer (dot-path) to clip.
+        layer_name (str): Dot-path (relative or global).
         clip_value (float): Max absolute value to retain in weight.
-            No-op if None.
-
-    Raises:
-        TypeError: If layer is not nn.Linear.
     """
     if clip_value is None:
         return
 
-    layer = cast(nn.Linear, get_op_by_name(module, layer_name))
-    if not isinstance(layer, nn.Linear):
-        raise TypeError(f"Expected nn.Linear, got {type(layer)} for layer {layer_name}")
+    # Convert global path to relative path (safe fallback)
+    for candidate_prefix in ["model.layers.", "layers.", "transformer.layers."]:
+        match = re.match(rf"^{re.escape(candidate_prefix)}\d+\.(.+)", layer_name)
+        if match:
+            original = layer_name
+            layer_name = match.group(1)
+            logger.debug(
+                f"[apply_clip] Converted global → relative: {original} → {layer_name}"
+            )
+            break
 
+    try:
+        layer = cast(nn.Linear, get_op_by_name(module, layer_name))
+    except ValueError as e:
+        raise ValueError(
+            f"❌ Failed to locate {layer_name} inside {module.__class__.__name__}"
+        ) from e
+
+    if not isinstance(layer, nn.Linear):
+        raise TypeError(f"Expected nn.Linear, got {type(layer)} for {layer_name}")
+
+    # Move to GPU, apply clamp, move back
     device = get_best_device()
     layer.to(device)
 
     max_val_tensor = torch.tensor(clip_value, device=device)
-    original_shape = layer.weight.shape
+    layer.weight.data.clamp_(-max_val_tensor, max_val_tensor)
 
-    layer.weight.data = torch.clamp(
-        layer.weight.data.view(-1), -max_val_tensor, max_val_tensor
-    ).view(original_shape)
+    if layer.bias is not None:
+        layer.bias.data.clamp_(-max_val_tensor, max_val_tensor)
 
     logger.debug(f"[apply_clip] {layer_name} clipped to ±{clip_value:.4f}")
     layer.cpu()

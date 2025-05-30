@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from awq.modules.linear import WQLinear_GEMM
 from awq.utils.module import set_op_by_name
+from utils.find_layer_type import is_attention_layer
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,49 @@ class ScaleEntry:
 
     def __repr__(self):
         return f"ScaleEntry(name={self.name}, subnames={self.subnames}, value_shape={self.value.shape})"
+
+
+def clear_up_module_memory(
+    module: nn.Module,
+    input_feat: Optional[Dict[str, torch.Tensor]] = None,
+    device: Union[str, torch.device] = "cpu",
+) -> None:
+    """
+    Move a module and its associated buffers to CPU, and clear memory-heavy dicts.
+
+    This helps free VRAM during quantization workflows.
+
+    Args:
+        module (nn.Module): The model block to clean up.
+        input_feat (Optional[Dict[str, Tensor]]): Input activations to clear.
+        layer_kwargs (Optional[Dict[str, Tensor]]): Optional kwargs to move and clear.
+        device (str | torch.device): Target device (usually 'cpu').
+    """
+    device = torch.device(device)
+    logger.debug(f"🧹 Clearing module {module.__class__.__name__} to {device}")
+    module.to(device)
+
+    # Move rotary embedding cache if present
+    if hasattr(module, "self_attn") and hasattr(module.self_attn, "rotary_emb"):
+        re = module.self_attn.rotary_emb
+        if getattr(re, "cos_cached", None) is not None:
+            re.cos_cached = re.cos_cached.to(device)
+            logger.debug("   ↳ Moved rotary_emb.cos_cached to CPU")
+        if getattr(re, "sin_cached", None) is not None:
+            re.sin_cached = re.sin_cached.to(device)
+            logger.debug("   ↳ Moved rotary_emb.sin_cached to CPU")
+
+    # Clear input features
+    if input_feat:
+        input_feat.clear()
+        logger.debug("   ↳ Cleared input_feat")
+
+    # Skip moving layer_kwargs — keep on GPU
+    logger.debug("   ↳ Skipped moving layer_kwargs (kept on GPU)")
+
+    # Trigger garbage collection and VRAM release
+    torch.cuda.empty_cache()
+    logger.debug("   ↳ Emptied CUDA cache")
 
 
 def flatten_scales_or_clip_list(
@@ -311,13 +355,48 @@ def load_quantized_layers_into_model(
     return model
 
 
-import os
-import torch
-import logging
-from typing import Optional
-from awq.modules.linear.gemm import WQLinear_GEMM
+def move_module_to_device(
+    module: nn.Module,
+    input_feat: Dict[str, torch.Tensor],
+    scales: Optional[torch.Tensor] = None,
+    zeros: Optional[torch.Tensor] = None,
+    device: Union[str, torch.device] = "cuda",
+) -> None:
+    """
+    Move a module and its related tensors to the specified device.
 
-logger = logging.getLogger(__name__)
+    Includes the module, input features, rotary cache, and optionally scales/zeros.
+
+    Args:
+        module (nn.Module): The model block to move.
+        input_feat (Dict[str, torch.Tensor]): Activation inputs.
+        scales (Optional[torch.Tensor]): Calibration scale tensor.
+        zeros (Optional[torch.Tensor]): Calibration zero point tensor.
+        device (str | torch.device): The target device.
+    """
+    device = torch.device(device)
+    logger.debug(f"🔄 Moving module {module.__class__.__name__} to {device}")
+    module.to(device)
+
+    for name, tensor in input_feat.items():
+        input_feat[name] = tensor.to(device)
+        logger.debug(f"   ↳ Moved input_feat[{name}] to {device}")
+
+    if scales is not None:
+        scales.to(device)
+        logger.debug("   ↳ Moved scales to device")
+    if zeros is not None:
+        zeros.to(device)
+        logger.debug("   ↳ Moved zeros to device")
+
+    if hasattr(module, "self_attn") and hasattr(module.self_attn, "rotary_emb"):
+        re = module.self_attn.rotary_emb
+        if getattr(re, "cos_cached", None) is not None:
+            re.cos_cached = re.cos_cached.to(device)
+            logger.debug("   ↳ Moved rotary_emb.cos_cached to device")
+        if getattr(re, "sin_cached", None) is not None:
+            re.sin_cached = re.sin_cached.to(device)
+            logger.debug("   ↳ Moved rotary_emb.sin_cached to device")
 
 
 def persist_quantized_layer(
@@ -400,3 +479,25 @@ def unwrap_to_transformer(model: nn.Module) -> nn.Module:
         raise AttributeError(
             "Could not unwrap model to transformer. Unexpected structure."
         )
+
+
+def move_rope_to_device(
+    model: torch.nn.Module, device: Union[str, torch.device]
+) -> None:
+    """
+    Move rotary position embeddings (RoPE) to the specified device, if present.
+
+    Args:
+        model: The top-level model (may contain .model submodule).
+        device: Target device (e.g., "cuda:0" or torch.device).
+    """
+    try:
+        device = torch.device(device)  # ✅ Coerce to torch.device
+        transformer = getattr(model, "model", model)
+        if hasattr(transformer, "rotary_emb"):
+            rope = transformer.rotary_emb
+            if rope.device != device:
+                transformer.rotary_emb = rope.to(device)
+                logging.info(f"🔁 [RoPE] Moved rotary_emb to {device}")
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to move rotary_emb to {device}: {e}")

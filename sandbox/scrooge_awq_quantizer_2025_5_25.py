@@ -91,8 +91,6 @@ from awq.modules.linear.gemm import WQLinear_GEMM
 
 # Project level
 from utils.gpu_monitor import log_gpu_usage
-from utils.find_layer_type import is_attention_layer, is_mlp_layer
-from utils.offload_to_cpu import offload_tensor_to_cpu
 from quantize.quantize_utils import (
     safe_update,
     unwrap_to_transformer,
@@ -101,14 +99,11 @@ from quantize.quantize_utils import (
     get_safe_parallel_sample_count,
     persist_quantized_layer,
     load_quantized_layers_into_model,
-    move_rope_to_device,
-    move_module_to_device,
-    clear_up_module_memory,
 )
 from quantize.scrooge_scale import (
-    apply_scale_all_groups,
+    apply_scale,
     apply_clip,
-    normalize_scales_across_groups,
+    normalize_scales_across_group,
 )  # import apply_scale from custom scale module
 
 logger = logging.getLogger(__name__)
@@ -226,8 +221,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.max_chunk_memory = 64 * 1024 * 1024  # 64 MB
         # * standard default is 1024 MB (too large for most consumer laptop GPUs)
         # amount of memory allowed when chunking/calibrating activations for scale search.
-        self.duo_scaling = True  #! ALWAYS set to True
-        self.zero_point = True  #! Always Set to True (asymmetric)
+        self.duo_scaling = False
+        self.zero_point = False  # Set to symmetric
         self.w_bit: int = 4
 
     @staticmethod
@@ -548,6 +543,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             layer_kwargs = self.model.model.prepare_inputs_for_generation(
                 samples, **layer_kwargs
             )
+            layer_kwargs.pop("input_ids", None)  # input_ids not needed
             logger.info(f"✅ [init_quant] Prepared model input kwargs for generation.")
         except Exception as e:
             logger.error(
@@ -589,10 +585,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         # * 🚨 Explicit cleanup of memory-holding calibration tensors
         if "samples" in locals():
             del samples
-
-        # commented out: very small/no need to remove this
-        # if "attention_mask" in layer_kwargs:
-        #     del layer_kwargs["attention_mask"]
+        if "attention_mask" in layer_kwargs:
+            del layer_kwargs["attention_mask"]
+        layer_kwargs.clear()
 
         gc.collect()  # triggers immediate cleanup
 
@@ -607,6 +602,67 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.info(f"[init_quant] Layer {i} devices: {device_types}")
 
         return modules, layer_kwargs, inps[0]
+
+    # todo: obsolete; delete later
+    def init_quant_modules_only(
+        self, precomputed_embeds: torch.Tensor
+    ) -> Tuple[List[nn.Module], Dict[str, Any], None]:
+        """
+        * Use this method if embeddings are precomputed and loaded in from file.
+
+        Init modules + forward kwargs only — skip sampling and embedding.
+        """
+        modules = self.get_model_layers(self.model)
+
+        # Prepare generation inputs just like init_quant would do
+        try:
+            layer_kwargs = self.model.prepare_inputs_for_generation(precomputed_embeds)
+            layer_kwargs.pop("input_ids", None)  # don't need input_ids
+        except Exception:
+            layer_kwargs = {}
+
+        return modules, layer_kwargs, None
+
+    def use_precomputed_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        expected_num_samples: Optional[int] = None,
+    ) -> None:
+        """
+        Inject precomputed input embeddings into the quantizer.
+
+        This bypasses tokenization and embedding steps and prepares
+        the quantizer to run calibration immediately.
+
+        Args:
+            embeddings (torch.Tensor): Precomputed input activations [n_samples, seq_len,
+                hidden_dim].
+            expected_num_samples (int, optional): Sanity check to verify input batch size.
+
+        Sets:
+            self.inps: ← embeddings
+            self.modules: ← list of transformer blocks
+            self.module_kwargs: ← any generation-related inputs
+        """
+        if expected_num_samples is not None:
+            if embeddings.size(0) != expected_num_samples:
+                raise ValueError(
+                    f"Expected {expected_num_samples} samples, but got {embeddings.size(0)}"
+                )
+
+        logger.info(f"🔗 Injecting precomputed embeddings: {embeddings.shape}")
+
+        # 🔥 Unwrap if necessary
+        if hasattr(self.model, "model"):
+            logger.info(
+                f"Unwrapping nested model: {self.model.__class__} → {self.model.model.__class__}"
+            )
+            self.model = self.model.model
+
+        self.inps = embeddings
+        self.modules, self.module_kwargs, _ = self.init_quant_modules_only(embeddings)
+
+        logger.info("✅ Quantizer is ready to calibrate using precomputed embeddings.")
 
     def init_calibration(self) -> None:
         """
@@ -634,7 +690,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         inp: torch.Tensor,
         module2inspect: Optional[nn.Module] = None,
         kwargs: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[str, Tuple[str], torch.Tensor]:
         """
         * Override official method to search per layer only!
 
@@ -929,7 +985,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             f"[{get_op_name(module, layer)}] best_scales shape: {scales.shape}"
         )
         logger.debug(
-            f"[{get_op_name(module, layer)}] best_scales preview:{scales[:3, :]}"
+            f"[{get_op_name(module, layer)}] best_scales preview:\n{scales[:3, :]}"
         )
 
         assert scales.shape == (out_features, num_groups), (
@@ -940,8 +996,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         del inp, fp16_output
         clear_memory()
 
-        # return get_op_name(module, prev_op), (layer_name,), scales # Comment out for now
-        return scales
+        return get_op_name(module, prev_op), (layer_name,), scales
 
     def _compute_best_scale_groupwise(
         self,
@@ -1022,16 +1077,12 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
             # NOTE: s^-1 * x is fused here, according to paper
             if self.duo_scaling:
-                # 🧠 Core AWQ scaling: balances input and weight magnitudes
                 scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
                     min=1e-4
                 )
             else:
-                # 🛡 Fallback if dual scaling is off: normalize x_mean-based scales
-                scales = x_mean.pow(ratio).clamp(min=1e-4)
-                scales = scales / (scales.mean(dim=-1, keepdim=True) + 1e-6)
-
-            scales = scales.clamp(min=1e-4, max=10.0)  # extra clamping to prevent drift
+                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+            scales = scales / (scales.max() * scales.min()).sqrt()
             scales_view = scales.view(-1, 1).to(
                 device
             )  # ☑️ updated: flip dim to broadcast across num of groups input dims
@@ -1154,10 +1205,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             )
 
             max_val_tensor = self._compute_best_clip(layer.weight, input_feat)
-
-            if max_val_tensor.numel() != 1:
-                max_val_tensor = max_val_tensor.max()
-
             max_val: float = max_val_tensor.item()
 
             logger.info(f"[{layer_name}] best clip value = {max_val:.4f}")
@@ -1188,13 +1235,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         of the weights in that group. This helps shift the quantized representation
         toward a centered range, reducing quantization error.
 
-        Args:
-            weight (Tensor): [out_features, in_features]
-            scales (Tensor): [out_features, num_groups]
-            group_size (int): Number of input dims per group
-
-        Returns:
-            zeros (Tensor): [out_features, num_groups]
         ---
         🧠 Formula:
             zero = floor(-mean(weight_group) / scale + 0.5)
@@ -1229,51 +1269,26 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         Returns:
             torch.Tensor: Zero-points per group [num_groups]
-
-        Compute per-output, per-group zero-points for symmetric quantization.
         """
-        O, I = weight.shape
-
-        if I % group_size != 0:
+        out_features, in_features = weight.shape
+        if in_features % group_size != 0:
             raise ValueError(
-                f"Invalid group size: in_features={I} not divisible by group_size={group_size}"
+                f"Invalid group size: in_features={in_features} is not divisible by group_size={group_size}"
             )
 
-        G = I // group_size  # number of groups
-        device = weight.device
-        zeros = torch.empty(
-            (O, G), device=device, dtype=scales.dtype
-        )  # allocate output
+        num_groups = in_features // group_size
+        zeros = torch.empty(num_groups, device=weight.device)
 
-        # Comute zero points
-        for g in range(G):
-            start = g * group_size
-            end = (g + 1) * group_size
+        for i in range(num_groups):
+            group_weights = weight[:, i * group_size : (i + 1) * group_size]
+            group_mean = group_weights.mean()
+            scale = scales[i]
+            zero_point = torch.floor(-group_mean / scale + 0.5)
+            zeros[i] = zero_point
 
-            # Get group weight slice: [O, group_size]
-            group_weights = weight[:, start:end]
-
-            # Compute mean across input dims: [O]
-            mean_g = group_weights.mean(dim=1)
-
-            # Get corresponding scale vector for this group: [O]
-            scale_g = scales[:, g]
-
-            # Ensure both tensors are on same device
-            mean_g = mean_g.to(device)
-            scale_g = scale_g.to(device)
-
-            # Compute zero point: [O]
-            zeros[:, g] = torch.floor(-mean_g / scale_g + 0.5)
-
-            # Debug log for first few values
-            if g == 0:
-                logger.debug(
-                    f"[compute_zeros] Group {g}: "
-                    f"mean_g[0]={mean_g[0].item():.4f}, "
-                    f"scale_g[0]={scale_g[0].item():.4f}, "
-                    f"zero[0]={zeros[0, g].item():.2f}"
-                )
+            logger.debug(
+                f"[Group {i}] mean={group_mean.item():.6f}, scale={scale.item():.6f}, zero={zero_point.item():.2f}"
+            )
 
         logger.info(f"✅ Computed zero-points: shape={zeros.shape}")
         return zeros
@@ -1315,10 +1330,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         start_time = time.time()
         logger.info("🚀 [calibrate] Starting full quantization pass")
 
-        # Set device (gpu/cup)
-        device = get_best_device()  # pylint: disable=global-variable-undefined
-
-        # * Init calibration
         self.init_calibration()
         self.model = self.model.to(device)
         logger.info("Model set up for quantization.")
@@ -1326,7 +1337,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         if self.modules is None or self.inps is None:
             raise RuntimeError("Calibration data (modules or inputs) not initialized.")
 
-        # * Calibrate and quantize
         total_layers_quantized = 0
         for idx, module in enumerate(self.modules):  # * ☑️ Outer loop
             logger.info(
@@ -1336,10 +1346,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 f"[calibrate] Block {idx} - before moving module to GPU"
             )  # log VRAM
 
-            # module = self.modules[idx] = self.modules[idx].to(
-            #     device
-            # )  # Move transformer block to GPU and update list
-            self.move_embed(self.model, device)  # Move shared embeddings back to GPU
+            module = module.to(device)
+            self.modules[idx] = module
 
             log_gpu_usage("[calibrate] After moving model to GPU")  # ⬅️ log VRAM
 
@@ -1348,44 +1356,24 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             )
             name_to_layer = {v: k for k, v in named_linears.items()}
 
-            # 💡 Input features captured while module is on CPU
             input_feat = self._get_input_feat(module, named_linears)
-            # input_feat = {k: v.to(device) for k, v in input_feat.items()}
+            input_feat = {k: v.to(device) for k, v in input_feat.items()}
             logger.debug(f"[Block {idx}] Input features captured.")
+            log_gpu_usage(
+                f"[calibrate] Block {idx} - input features moved to GPU"
+            )  # ⬅️ log VRAM
 
-            # 🚀 Move everything needed to GPU
-            move_module_to_device(module=module, input_feat=input_feat, device="cuda")
-
-            # Defensive check: reset or filter tensors
-            if self.module_kwargs is not None:
-                for k, v in self.module_kwargs.items():
-                    if isinstance(v, torch.Tensor):
-                        self.module_kwargs[k] = v.to(device)
-
-                module_config = self.awq_model.get_layers_for_scaling(
-                    module, input_feat, self.module_kwargs
-                )
-                logger.debug(f"[Block {idx}] Groups = {len(module_config)}")
+            module_config = self.awq_model.get_layers_for_scaling(
+                module, input_feat, self.module_kwargs
+            )
+            logger.debug(f"[Block {idx}] Groups = {len(module_config)}")
 
             for group in module_config:
                 prev_op = group["prev_op"]
                 layers = group["layers"]
                 group_name = prev_op.__class__.__name__
 
-                # Resolve actual layer names (needed for attention check)
-                layer_names = [
-                    str(name_to_layer[layer])
-                    for layer in layers
-                    if name_to_layer.get(layer)
-                ]
-
                 logger.info(f"\n⚙️  [Group: {group_name}] {len(layers)} layers")
-
-                # # Move RoPE back to GPU if needed
-                # if is_attention_layer([str(group_name)]) or is_attention_layer(
-                #     layer_names
-                # ):
-                #     move_rope_to_device(self.model, device)
 
                 # 1. Compute scales per layer
                 scales_dict = {}
@@ -1399,76 +1387,54 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         f"[calibrate] Block {idx} - before scale search ({layer_name})"
                     )  # ⬅️ log VRAM
 
-                    best_scales = self._search_best_scale(
+                    op_name, _, best_scales = self._search_best_scale(
                         module=module,
                         prev_op=prev_op,
                         layer=layer,
                         inp=input_feat[layer_name],
                     )
 
-                    best_scales = best_scales.to(device)
-                    scales_dict[layer_name] = best_scales
-
                     log_gpu_usage(
                         f"[calibrate] Block {idx} - after scale search ({layer_name})"
                     )  # ⬅️ log VRAM
 
+                    best_scales = best_scales.to(device)
+                    scales_dict[layer_name] = best_scales
                     logger.debug(
                         f"[raw scales] {layer_name} → shape: {best_scales.shape}, preview: {best_scales[:5].tolist()}"
                     )
 
-                # 2. Normalize only if this is a QKV group (by checking all layer names)
-                layer_names = [name_to_layer[layer] for layer in layers]
-
-                if is_attention_layer([str(group_name)]) or is_attention_layer(
-                    layer_names
-                ):
-                    # if all(any(tag in name for tag in qkv_tags) for name in layer_names):
-                    logger.info("🔁 Normalizing QKV group scales across shared input")
-                    normalized_scales = normalize_scales_across_groups(
-                        layers=layers,
-                        name_to_layer=name_to_layer,
-                        scales_dict=scales_dict,
-                    )
-                else:
-                    normalized_scales = scales_dict  # no change
-
-                # ✅ Update scale tensors with normalized layers
-                for layer in layers:
-                    name = name_to_layer[layer]
-                    scales_dict[name] = normalized_scales[name]
-
+                # 2. Normalize scales across the group
+                normalized_scales = normalize_scales_across_group(
+                    layers=layers,
+                    name_to_layer=name_to_layer,
+                    scales_dict=scales_dict,
+                )
+                for name, scale_tensor in list(normalized_scales.items()):
                     logger.debug(
-                        f"[normalized scales] {name} → shape: {scales_dict[name].shape}, "
-                        f"preview: {scales_dict[name][:5].tolist()}"
+                        f"[normalized scales] {name} → shape: {scale_tensor.shape}, preview: {scale_tensor[:5].tolist()}"
                     )
 
                 log_gpu_usage(
                     f"[calibrate] Block {idx} - after normalizing scales"
                 )  # ⬅️ log VRAM
 
-                # 3. Apply scale, compute zeros, clip, quantize, save, clear VRAM
+                # 3. Apply scale, compute zeros, clip, quantize
                 for layer in layers:
-
-                    # * Save a copy of original weights
-                    original_weight = layer.weight.detach().clone()
-                    logger.info("Created copy of original weight.")
-
                     layer_name = name_to_layer[layer]
 
                     # Apply scales
-                    scales = scales_dict[layer_name]
-                    logger.info(f"🧪 [apply] scale to {layer_name}")
-                    apply_scale_all_groups(layer=layer, scales=scales)
-                    logger.info(f"Scales applied to {layer_name}")
+                    scales = normalized_scales[layer_name]
+                    logger.info(f"🧪 [apply] {layer_name}")
 
-                    # move scales to CPU to free up VRAM
-                    scales = offload_tensor_to_cpu(scales)
+                    apply_scale(
+                        module, [(get_op_name(module, prev_op), (layer_name,), scales)]
+                    )
 
                     # Apply clips
                     if self.apply_clip:
                         # Optional clipping
-                        input_feat_tensor = input_feat[layer_name]
+                        input_feat_tensor = input_feat.get(layer_name) or torch.empty(0)
                         clip_name, clip_value = self._search_best_clip(
                             layer=layer,
                             named_linears=named_linears,
@@ -1477,96 +1443,22 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         if clip_value is not None:
                             apply_clip(module, clip_name, clip_value)
                             logger.info(f"[clip] {clip_name} ← {clip_value:.4f}")
-
                         else:
                             logger.debug(f"[clip] {clip_name} skipped")
 
                     # Compute zeros
                     zeros = self.compute_zeros(layer.weight, scales, self.group_size)
                     logger.debug(
-                        f"[zeros] {layer_name} → {zeros.shape}, first 5: {zeros[:5].tolist()}"
+                        f"[zeros] {layer_name} → {zeros.shape}, first: {zeros[:5].tolist()}"
                     )
 
-                    zeros = offload_tensor_to_cpu(
-                        tensor=zeros
-                    )  # ✅ Move to CPU after zero computation
-
-                    # * Restore original weights & clear VRAM cache
-                    layer.weight.data.copy_(original_weight)
-                    del original_weight
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    logger.info("Original weights restored and VRAM memory cleared.")
-
-                    # * ✅ Quantize & replace sub-layer with quantized GEMM layer
-
-                    # ✅ Load all to GPU before GEMM creation
-                    device = (
-                        layer.weight.device
-                        if layer.weight.is_cuda
-                        else get_best_device()
-                    )
-                    scales = scales.to(device)
-                    zeros = zeros.to(device)
-                    layer = layer.to(device)
-
-                    # ! Transpose to -> [G, O] (input feature, output feature shape)
-                    scales_t = scales.t().contiguous()  # shape: [G, O]
-                    zeros_t = zeros.t().contiguous()  # shape: [G, O]
-
-                    # todo: debug; delete later
-                    # 🔍 Quantization debug peek
-                    logger.debug("Checking before WQLinear_GEMM:")
-                    logger.debug(
-                        f"[{layer_name}] weight: max={layer.weight.abs().max():.6f}, min={layer.weight.min():.6f}, shape={layer.weight.shape}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] scales: shape={scales_t.shape}, max={scales_t.max():.6f}, min={scales_t.min():.6f}, mean={scales_t.mean():.6f}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] zeros: shape={zeros_t.shape}, max={zeros_t.max():.2f}, min={zeros_t.min():.2f}, mean={zeros_t.float().mean():.2f}"
-                    )
-
-                    # Optional: print actual small slice
-                    logger.debug(
-                        f"[{layer_name}] scale[0, :5] = {scales_t[0, :5].tolist()}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] zero[0, :5]  = {zeros_t[0, :5].tolist()}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] weight[0, :5] = {layer.weight[0, :5].tolist()}"
-                    )
-
+                    # Replace sub-layer with quantized GEMM layer
                     quantized_layer = WQLinear_GEMM.from_linear(
                         linear=layer,
                         w_bit=self.w_bit,
                         group_size=self.group_size,
-                        scales=scales_t,
-                        zeros=zeros_t,
-                    )
-
-                    # todo: debug; delete later
-                    logger.debug("Checking after WQLinear_GEMM:")
-                    logger.debug(
-                        f"[{layer_name}] qweight shape = {quantized_layer.qweight.shape}, dtype = {quantized_layer.qweight.dtype}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] qzeros shape = {quantized_layer.qzeros.shape}, dtype = {quantized_layer.qzeros.dtype}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] scales shape = {quantized_layer.scales.shape}, dtype = {quantized_layer.scales.dtype}"
-                    )
-
-                    # Optional: log first few values
-                    logger.debug(
-                        f"[{layer_name}] qweight[0, :10] = {quantized_layer.qweight[0, :10].tolist()}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] qzeros[0, :10]  = {quantized_layer.qzeros[0, :10].tolist()}"
-                    )
-                    logger.debug(
-                        f"[{layer_name}] scales[0, :5]   = {quantized_layer.scales[0, :5].tolist()}"
+                        scales=scales,
+                        zeros=zeros,
                     )
 
                     set_op_by_name(
@@ -1577,139 +1469,277 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         f"[calibrate] Block {idx} - after replacing {layer_name}"
                     )  # ⬅️ log VRAM
 
-                    # Persist layer to disk
-                    module_name = get_op_name(self.model, module)
-
-                    if not save_dir_path:
-                        raise ValueError(
-                            "❌ save_dir_path must be provided to persist quantized layers."
+                    if save_dir_path:
+                        persist_quantized_layer(
+                            quantized_layer, save_dir=str(save_dir_path)
                         )
-
-                    save_success = persist_quantized_layer(
-                        quant_layer=quantized_layer,
-                        save_dir=str(save_dir_path),
-                        module_name=module_name,
-                        sub_layer_name=layer_name,
-                    )
-
-                    if not save_success:
-                        logger.warning(
-                            f"⚠️ Skipped saving {module_name}.{layer_name} due to previous error."
-                        )
-
-                    # ✅ CLEANUP VRAM memory
-                    # clear input features
-                    if layer_name in input_feat:
-                        del input_feat[layer_name]
-
-                    # ✅ FREE TRANSIENT TENSORS FROM VRAM (scales, zeros, etc.)
-                    del scales, zeros, scales_t, zeros_t
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                    # ✅ NOW safe to move entire module/layer to CPU
-                    layer.cpu()
-
-                    log_gpu_usage(
-                        f"[free_input] Freed input_feat for {layer_name}"
-                    )  # ⬅️ log VRAM
+                        logger.debug(f"💾 Saved {layer_name} to {save_dir_path}")
 
                 # Count loops
                 total_layers_quantized += len(layers)
 
-                # # Move RoPE embeddings off GPU if attention was used
-                # if is_attention_layer([str(group_name)]) or is_attention_layer(
-                #     layer_names
-                # ):
-                #     move_rope_to_device(self.model, "cpu")
-
-            log_gpu_usage(
-                f"[calibrate] Block {idx} - end of block before memory cleanup"
-            )  # ⬅️ log VRAM
-
-            clear_up_module_memory(
-                module=module,
-                input_feat=input_feat,
-                device="cpu",
-            )
-
-            # # todo: commented out for now; delete the code later
-            # # Move current module back to CPU and update list
-            # module = module.cpu()
-            # self.modules[idx] = module
-
-            # # Move shared embeddings off GPU
-            # self.move_embed(self.model, "cpu")
-
-            # # Trigger cleanup
-            # torch.cuda.empty_cache()
-            # gc.collect()
-
-            log_gpu_usage(
-                f"[calibrate] Block {idx} - end of block after memory cleanup"
-            )  # ⬅️ log VRAM
-
-            logger.info(
-                f"[Block {idx}] Quantized {len(layers)} layers across {len(module_config)} groups."
-            )
+            torch.cuda.empty_cache()
+            gc.collect()
+            log_gpu_usage(f"[calibrate] Block {idx} - after memory cleanup")
 
         logger.info(f"🔢 Total quantized layers: {total_layers_quantized}")
         elapsed = time.time() - start_time
         logger.info(f"\n🏁 Finished calibration + quantization in {elapsed:.2f} sec")
 
-    def verify_saved_layers(self, load_dir_path: str, strict: bool = True) -> None:
+    def load_calibration_stats(self, calib_stats_path: str) -> None:
         """
-        Verify that all expected per-layer quantized files (layer_0.pt, layer_1.pt, ...)
-        exist in the specified directory.
+        Load calibration statistics (scales and clips) from a .pt file and assign them
+        to internal state (`self.all_scales` and `self.all_clips`).
 
         Args:
-            load_dir_path (str): Directory to check.
-            strict (bool): If True, raise error if any file is missing. If False, log warnings.
+            calib_stats_path (str): Path to the saved 'calib_stats.pt' file. Expected content:
+                - "scales": Dict[str, torch.Tensor] - Mapping of operation names to scale tensors.
+                - "clips": Dict[str, torch.Tensor] (optional) - Mapping of operation names to
+                clip tensors.
 
         Raises:
-            FileNotFoundError: If any expected layer file is missing (only if `strict=True`).
+            ValueError: If 'scales' entry is missing or empty.
+
+        Example:
+            >>> quantizer.load_calibration_stats("/path/to/calib_stats.pt")
+
+        Logging:
+            - Logs the number of scales and clips loaded.
+            - Provides a brief preview of tensor shapes, mean, and standard deviation.
         """
-        num_layers = len(self.model.model.layers)
-        missing = []
+        stats = torch.load(calib_stats_path, map_location="cpu")
+        all_scales: Dict[str, torch.Tensor] = stats.get("scales") or {}
+        all_clips: Dict[str, torch.Tensor] = stats.get("clips") or {}
+
+        # Check/error handling
+        if not isinstance(all_scales, dict) or not all(
+            isinstance(v, torch.Tensor) for v in all_scales.values()
+        ):
+            raise ValueError(
+                "Scales data is not in the expected format (Dict[str, Tensor])."
+            )
+
+        if all_clips and not all(
+            isinstance(v, torch.Tensor) for v in all_clips.values()
+        ):
+            raise ValueError(
+                "Clip data is not in the expected format (Dict[str, Tensor])."
+            )
+
+        num_scales = len(all_scales)
+        num_clips = len(all_clips)
+
+        if num_scales == 0:
+            logger.error(
+                "❌ No scale entries found — calibration may have failed or file is corrupted."
+            )
+            raise ValueError("Empty or missing 'scales' in calibration stats.")
 
         logger.info(
-            f"🔍 Verifying presence of {num_layers} layer files in: {load_dir_path}"
+            f"📥 Loaded calibration stats: {num_scales} scales, {num_clips} clips"
         )
-        for i in range(num_layers):
-            layer_file = os.path.join(load_dir_path, f"layer_{i}.pt")
-            if not os.path.isfile(layer_file):
-                missing.append(f"layer_{i}.pt")
 
-        if missing:
-            msg = f"❌ Missing {len(missing)} layer files: {missing}"
-            if strict:
-                raise FileNotFoundError(msg)
-            else:
-                logger.warning(msg)
+        # * Update the model in the class
+        self.all_scales = all_scales
+        self.all_clips = all_clips
+
+        # Preview utility
+        def _preview_tensor_dict(
+            name: str, tensor_dict: Dict[str, torch.Tensor], limit: int = 5
+        ):
+            for k, v in list(tensor_dict.items())[:limit]:
+                logger.debug(
+                    f" - {name} {k}: shape={tuple(v.shape)}, mean={v.mean():.4f}, std={v.std():.4f}"
+                )
+
+        logger.debug("📊 Previewing loaded scales:")
+        _preview_tensor_dict("Scale", self.all_scales)
+
+        if self.all_clips:
+            logger.debug("📊 Previewing loaded clips:")
+            _preview_tensor_dict("Clip", self.all_clips)
         else:
-            logger.info("✅ All expected layer files found.")
+            logger.debug("No clip data found.")
 
-    def load_saved_layer_weights(self, load_dir_path: str) -> None:
+    def quantize_and_save_layer(
+        self,
+        layer: nn.Module,
+        layer_name: str,
+        scales: torch.Tensor,
+        zeros: torch.Tensor,
+    ) -> nn.Module:
         """
-        Load previously saved per-layer quantized weights (layer_0.pt, layer_1.pt, ...)
-        into `self.model` in memory. Does not save anything.
+        Process a single layer: quantize and optionally save to disk.
 
         Args:
-            load_dir_path (str): Directory containing saved layer_*.pt files.
+            layer (nn.Module): The original linear layer to be quantized.
+            layer_name (str): The name identifier for the layer.
+            scales (torch.Tensor): Precomputed scales for the layer.
+            zeros (torch.Tensor): Precomputed zero points for the layer.
         """
-        num_layers = len(self.model.model.layers)
+        # Quantize the layer
+        quantized_layer = self.quantize_layer(layer, scales, zeros)
 
-        logger.info(f"📥 Loading {num_layers} layers from {load_dir_path}")
+        # Save the entire layer with all data (scales, qweight, qzeros)
+        if self.save_per_layer and self.save_dir:
+            save_path = os.path.join(self.save_dir, f"{layer_name}_quant.pt")
+            torch.save(quantized_layer.state_dict(), save_path)
+            self.layer_paths.append(save_path)
+            logger.info(f"Saved quantized layer {layer_name} to {save_path}")
 
-        for i in range(num_layers):
-            layer_path = os.path.join(load_dir_path, f"layer_{i}.pt")
-            if not os.path.exists(layer_path):
-                raise FileNotFoundError(f"Missing: {layer_path}")
-            state_dict = torch.load(layer_path, map_location="cpu")
-            self.model.model.layers[i].load_state_dict(state_dict)
-            logger.info(f"✅ Loaded layer_{i}.pt into model")
+        return quantized_layer
 
-        logger.info("🔗 All layers loaded into memory. Ready for inference or export.")
+    def quantize_layer(
+        self, layer: nn.Module, scales: torch.Tensor, zeros: torch.Tensor
+    ) -> nn.Module:
+        """
+        Convert a given linear layer to its quantized version using the WQLinear_GEMM class.
+
+        Args:
+            layer (nn.Module): The original linear layer to be quantized.
+            scales (torch.Tensor): Precomputed scales for the layer.
+            zeros (torch.Tensor): Precomputed zero points for the layer.
+
+        Returns:
+            nn.Module: The quantized version of the input layer.
+        """
+        # Convert to quantized linear layer
+        q_linear = WQLinear_GEMM.from_linear(
+            linear=layer,
+            w_bit=self.w_bit,
+            group_size=self.group_size,
+            scales=scales,
+            zeros=zeros,
+        )
+        return q_linear
+
+    def quant_with_calib_scales(self) -> None:
+        """
+        Apply quantization to all Linear layers in the model using the calibration scales.
+
+        This method applies quantization using precomputed scales and dynamically calculated
+        zero-points. The process involves iterating over all modules, identifying Linear
+        layers, and replacing them with quantized versions.
+
+        Steps:
+            1. Validates calibration scales are available.
+            2. Get named layers [Block1, Block2, ..., Block24]
+            3. Iterates through all modules in the model (get_linear) and
+            Applies quantization to each Linear layer based on the calibration scales.
+            4. Logs timing and status for each layer.
+
+            * Note:
+            * get_linear outputs grabs Lower-Level Extraction of Linear Layers:
+                {
+                "self_attn.q_proj": LinearLayer1,
+                "self_attn.k_proj": LinearLayer2,
+                "self_attn.v_proj": LinearLayer3,
+                "self_attn.o_proj": LinearLayer4,
+                "mlp.gate_proj": LinearLayer5,
+                "mlp.up_proj": LinearLayer6,
+                "mlp.down_proj": LinearLayer7,
+                }
+        Raises:
+            RuntimeError: If `self.modules` is not set.
+            ValueError: If calibration scales (`self.all_scales`) are not loaded.
+
+        Logging:
+            - Logs the start and completion of the quantization process.
+            - Provides per-layer timing for quantization.
+            - Logs skipped layers due to missing scales or missing `weight` attribute.
+
+        Example:
+            >>> quantizer.quant_with_calib_scales()
+
+        Notes:
+            - Uses WQLinear_GEMM as the quantized linear layer implementation.
+            - Skipped layers are logged for further inspection.
+        """
+        start_time = time.time()
+        layer_times = {}
+        skipped_count = 0
+
+        # Step 1: Check & validate
+        # Check layer
+        if not self.modules:
+            logger.info("Modules not initialized. Fetching model layers...")
+            self.modules = self.get_model_layers(self.model)
+            logger.info(f"Modules initialized. Total layers: {len(self.modules)}")
+
+        # Check scales loaded properly
+        if not hasattr(self, "all_scales") or not self.all_scales:
+            raise ValueError(
+                "❌ `self.all_scales` is not populated. Run calibration first."
+            )
+
+        # Step 2: Iterate over modules and apply quantization
+        for module in self.modules:
+            named_linears = get_named_linears(module)
+
+            for name, linear_layer in named_linears.items():
+                # Full path to the layer
+                op_name = get_op_name(self.model, linear_layer)
+
+                # Ensure layer has a weight attribute
+                if not hasattr(linear_layer, "weight"):
+                    logger.warning(
+                        f"Skipping {op_name}: Layer has no `weight` attribute."
+                    )
+                    skipped_count += 1
+                    continue
+
+                # Timer start
+                layer_start_time = time.time()
+
+                # Ensure scales are available for this layer
+                if op_name not in self.all_scales:
+                    logger.warning(f"Skipping {op_name}: No scale found.")
+                    skipped_count += 1
+                    continue
+
+                scales = self.all_scales[op_name]
+
+                # Compute zeros dynamically
+                zeros = self.compute_zeros(linear_layer.weight, scales, self.group_size)
+
+                # Create quantized layer
+                quantized_layer = WQLinear_GEMM.from_linear(
+                    linear=linear_layer,
+                    w_bit=self.w_bit,
+                    group_size=self.group_size,
+                    scales=scales,
+                    zeros=zeros,
+                )
+
+                # Traverse to the parent module
+                tokens = op_name.split(".")
+                parent = self.model
+                for token in tokens[:-1]:
+                    parent = getattr(parent, token)
+
+                # Replace the layer in the parent module
+                setattr(parent, tokens[-1], quantized_layer)
+
+                # Timer end and log time
+                elapsed_time = time.time() - layer_start_time
+                layer_times[op_name] = elapsed_time
+                logger.info(f"⏱️ Quantized {op_name} in {elapsed_time:.4f} seconds.")
+
+        # Step 3: Overall timing
+        total_time = time.time() - start_time
+        logger.info(f"✅ Quantization completed in {total_time:.4f} seconds.")
+
+        # Summary of skipped layers
+        if skipped_count > 0:
+            logger.info(
+                f"🔍 Skipped {skipped_count} layers due to missing scales or missing `weight` attribute."
+            )
+        else:
+            logger.info("✅ No layers were skipped during quantization.")
+
+        # Detailed timing report
+        for op_name, elapsed_time in layer_times.items():
+            logger.debug(f"Layer {op_name}: {elapsed_time:.4f} seconds")
 
     def save_quantized_and_configs(
         self,
