@@ -93,17 +93,17 @@ from awq.modules.linear.gemm import WQLinear_GEMM
 from utils.gpu_monitor import log_gpu_usage
 from utils.find_layer_type import is_attention_layer, is_mlp_layer
 from utils.offload_to_cpu import offload_tensor_to_cpu
+from utils.check_existing import are_block_sublayers_quantized
 from quantize.quantize_utils import (
-    safe_update,
     unwrap_to_transformer,
     flatten_scales_or_clip_list,
-    ScaleEntry,
     get_safe_parallel_sample_count,
     persist_quantized_layer,
     load_quantized_layers_into_model,
     move_rope_to_device,
     move_module_to_device,
     clear_up_module_memory,
+    forward_with_memory_chunking,
 )
 from quantize.scrooge_scale import (
     apply_scale_all_groups,
@@ -207,6 +207,10 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         self.module_kwargs: Optional[Dict[str, Any]] = None
         self.inps: Optional[torch.Tensor] = None
 
+        # * Calibration device (gpu/cpu) (calibration the most computationally expensive)
+        self.full_gpu = False  # set to False
+        self.hybrid_mode = True  # default to hybrid
+
         # ✅ Calibration results
         self.all_scales: List[Tuple[str, torch.Tensor]] = []
         self.all_clips: List[Tuple[str, torch.Tensor]] = []
@@ -222,8 +226,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         )
 
         # ✅ Others:
-        self.modules_to_not_convert = []  # empty = quantize everything
+        self.modules_to_not_convert = ["o_proj", "embed_tokens", "lm_head"]
         self.max_chunk_memory = 64 * 1024 * 1024  # 64 MB
+
         # * standard default is 1024 MB (too large for most consumer laptop GPUs)
         # amount of memory allowed when chunking/calibrating activations for scale search.
         self.duo_scaling = True  #! ALWAYS set to True
@@ -720,13 +725,28 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         module2inspect = module2inspect or layer
         kwargs = kwargs or {}
 
+        # 🟩 Setup dual device config
+        if self.full_gpu:
+            forward_device = calibration_device = torch.device("cuda")  # ✅ All on GPU
+        elif self.hybrid_mode:
+            forward_device = torch.device("cuda")
+            calibration_device = torch.device("cpu")  # ⚖️ Forward on GPU, stats on CPU
+        else:
+            forward_device = calibration_device = torch.device(
+                "cpu"
+            )  # 🐢 Fallback: full CPU
+
+        logger.info(
+            f"💡 Quant forward_device: {forward_device}, calibration_device: {calibration_device}"
+        )
+
+        # 🟩 Ensure layer is on forward device
+        layer.to(forward_device)
+
         # --- STEP 1: Compute grouped weight mean ---
         try:
             weight = layer.weight.detach()  # create a copy of the weights
             out_features, in_features = weight.shape  # get dim (for reshaping)
-
-            # if self.group_size <= 0:
-            #     raise ValueError("group_size must be > 0 for group quantization.")
 
             if in_features % self.group_size != 0:
                 raise ValueError(
@@ -746,18 +766,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 f"[{layer_name}] weight_grouped preview [:3, 0, :5]: {weight_grouped[:3, 0, :5].tolist()}"
             )
 
-            # todo: commented out; delete after debugging
-            # # Group-wise normalized weights
-            # w_max = weight_grouped.abs().amax(dim=-1, keepdim=True) + 1e-6
-            # w_scaled = weight_grouped.abs() / w_max
-            # w_mean = w_scaled.mean(
-            #     dim=-1
-            # )  #! shape: [O, G] (in Torch, row: output/col: input)
-            # # w_mean: Average weight magnitude per output group (all groups)
-
-            # logger.debug(f"[{layer_name}] w_mean.shape (group-wise) = {w_mean.shape}")
-
-            # Clear weight_grouped to save memory
             clear_memory(weight_grouped)
 
         except Exception as e:
@@ -766,7 +774,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         # --- STEP 2: Compute input mean (per input channel), chunked to avoid OOM
         try:
-            inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])
+            # ✅ run on calibration_device
+            inp_flat = inp.to(calibration_device).abs().view(-1, inp.shape[-1])
             num_elements = inp_flat.size(0)
             num_channels = inp_flat.size(1)
             chunk_size = min(
@@ -774,26 +783,17 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 num_elements,
             )
 
-            x_sum = torch.zeros(num_channels, dtype=torch.float32)
+            x_sum = torch.zeros(
+                num_channels, dtype=torch.float32, device=calibration_device
+            )  # setup holder; calibrate on cpu
             for i in range(0, num_elements, chunk_size):
                 end = min(i + chunk_size, num_elements)
                 x_sum += inp_flat[i:end].to(torch.float32).sum(dim=0)
 
-                # todo: delete later
-                # chunk_sum = inp_flat[i:end].to(torch.float32).sum(dim=0)
-                # x_sum += chunk_sum.to("cpu")  # device-safe addition
-
-            # todo: commented out b/c doing it in the loop; delete later
-            # x_mean = (x_sum / num_elements).to(inp.dtype)
-            # clear_memory()
-
-            # # Project x_mean to output channels → then regroup
-            # x_mean = x_mean.to(weight.device)  # Move to cpu for calculation
-
             # Project input activation mean into output channels
             x_mean_flat = (
-                (x_sum / num_elements).to(inp.dtype).to(weight.device)
-            )  # [in_features]
+                (x_sum / num_elements).to(inp.dtype).to(forward_device)
+            )  # [in_features]; forward on gpu
             x_mean_grouped = x_mean_flat.view(num_groups, self.group_size).mean(
                 dim=1
             )  # [num_groups]
@@ -834,7 +834,14 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         # --- STEP 3: Forward pass for FP16 output ---
         try:
             module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
-            fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
+            fp16_output = forward_with_memory_chunking(
+                module=module2inspect.to(
+                    forward_device
+                ),  # move module to forward device (gpu)
+                inp=inp,
+                module_kwargs=module_kwargs,
+                max_chunk_memory=self.max_chunk_memory,
+            )
 
             log_gpu_usage("[fp16_output] AFTER forward pass")  # ⬅️ VRAM logging
 
@@ -842,7 +849,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 torch.finfo(fp16_output.dtype).min,
                 torch.finfo(fp16_output.dtype).max,
             )
-            fp16_output = fp16_output.to("cpu")
+            fp16_output = fp16_output.to(
+                calibration_device
+            )  # to calibration device (cpu)
             torch.cuda.empty_cache()
 
             # VRAM logging
@@ -880,6 +889,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     f"[{layer_name}] Group {g} input (x_per_group) contains NaNs!"
                 )
                 raise ValueError("NaNs in input tensor during calibration.")
+
             logger.info(f"x_per_group shape == {x_per_group.shape}")
 
             w_per_group = layer.weight[:, start:end]  # i.e., [1536, 128]
@@ -896,8 +906,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             w_per_group_scaled = w_per_group.abs() / w_per_group_max
             w_per_group_mean = w_per_group_scaled.mean(dim=1)  # [O]
 
-            # Log VRAM utilization
-            log_gpu_usage(f"[{layer_name}] Group {g}: before scale search")
+            log_gpu_usage(
+                f"[{layer_name}] Group {g}: before scale search"
+            )  # ☑️ # Log VRAM
 
             # Call your per-group scale search
             best_scale_per_group = self._compute_best_scale_groupwise(
@@ -1001,75 +1012,85 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         start = group_idx * group_size
         end = (group_idx + 1) * group_size
 
-        n_grid = 20
         history = []
         best_ratio = -1
         best_scales = None
         best_error = float("inf")
 
-        org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+        # Set n grid and tolerance depending on tensor size
+        if fp16_output.shape[-1] >= 8192:  # For big MLPs like gate_proj/down_proj
+            n_grid = 10
+            early_stop_tolerance = 1.001
+        else:
+            n_grid = 20
+            early_stop_tolerance = 1.05
+        # todo: delete later
+        # org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
 
+        # Cache original weights directly instead of full state_dict
+        original_weights = {
+            fc: fc.weight[:, group_idx * group_size : (group_idx + 1) * group_size]
+            .detach()
+            .clone()
+            for fc in linears2scale
+        }
+
+        # todo: no need to call to cpu inside the loop
+        # x = x.to("cpu")
+        # fp16_output = fp16_output.to("cpu")
+        # for fc in linears2scale:
+        #     fc.cpu()
+
+        # Move to the right device
         device = x.device
         x_mean = x_mean.view(-1).to(device)
         w_mean = w_mean.view(-1).to(device)
+        fp16_output = fp16_output.to(device)
 
         assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"  # extra guard
         assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"  # extra guard
 
-        for ratio in range(n_grid):
-            # create new scales
-            ratio = ratio / n_grid
+        w_slice = torch.cat([original_weights[fc] for fc in linears2scale], dim=0)
+        std_anchor = w_slice.std().item()
+        std_anchor = max(std_anchor, 1e-5)  # avoid zero or tiny
 
-            # NOTE: s^-1 * x is fused here, according to paper
-            if self.duo_scaling:
-                # 🧠 Core AWQ scaling: balances input and weight magnitudes
-                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
-                    min=1e-4
-                )
-            else:
-                # 🛡 Fallback if dual scaling is off: normalize x_mean-based scales
-                scales = x_mean.pow(ratio).clamp(min=1e-4)
-                scales = scales / (scales.mean(dim=-1, keepdim=True) + 1e-6)
+        ratios = torch.linspace(0.25, 2.0, n_grid)
+        for ratio_idx, ratio in enumerate(ratios):
+            scale = ratio * std_anchor
+            scale = max(scale.item(), 1e-5)
 
-            scales = scales.clamp(min=1e-4, max=10.0)  # extra clamping to prevent drift
-            scales_view = scales.view(-1, 1).to(
-                device
-            )  # ☑️ updated: flip dim to broadcast across num of groups input dims
+            # Broadcast shape: (out_features, 1)
+            scales_view = torch.full((w_slice.shape[0], 1), scale, device=device)
 
-            # avoid scaling values that overflow
-            scales[torch.isinf(scales)] = 1
-            scales[torch.isnan(scales)] = 1
-
-            # Q(W * s)
+            # Quantize each layer
             for fc in linears2scale:
-                fc.weight[:, start:end].mul_(scales_view)  # ☑️ updated to slice weights
-                fc.weight.data[:, start:end] = (
-                    self.pseudo_quantize_tensor(fc.weight.data[:, start:end])[0]
-                    / scales_view
-                )  # ☑️ updated to slice weights
-                logger.debug(f"Group {group_idx}: scale shape = {scales_view.shape}")
+                with torch.no_grad():
+                    fc.weight[:, start:end].copy_(original_weights[fc])  # restore
+                    fc.weight[:, start:end].copy_(
+                        self.pseudo_quantize_tensor(fc.weight[:, start:end] / scale)[0]
+                        * scale
+                    )
 
-            # W * X
-            int_w_output = self._module_forward(x, module2inspect, kwargs)
-            int_w_output = int_w_output.clip(
-                torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max
-            )  # clamp
-            int_w_output = int_w_output.to(
-                "cpu"
-            )  # ☑️ Added to bring to same device as fp16_output
+            # Forward + error
+            int_w_output = self._module_forward(x, module2inspect, kwargs).clamp(
+                torch.finfo(fp16_output.dtype).min, torch.finfo(fp16_output.dtype).max
+            )
 
-            # compute mean squared error (L2 norm)
             loss = self._compute_loss(fp16_output, int_w_output, device)
 
             history.append(loss)
             if loss < best_error:
                 best_error = loss
                 best_ratio = ratio
-                best_scales = scales.clone()
+                best_scales = scales_view[:, 0].clone()
                 logger.debug(
-                    f"[Group {group_idx}] New best ratio = {ratio:.3f}, loss = {loss:.6f}"
+                    f"[Group {group_idx}] New best scale = {scale:.6f}, loss = {loss:.6f}"
                 )
-            module2inspect.load_state_dict(org_sd)
+            elif loss > best_error * early_stop_tolerance:
+                logger.debug(
+                    f"[Group {group_idx}] Early exit at ratio {ratio:.3f}, loss = {loss:.6f}"
+                )
+                break
 
         if best_ratio == -1:
             logger.error(f"No valid scale found for group. Loss history: {history}")
@@ -1078,7 +1099,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         assert best_scales is not None  # Add extra guard
         assert torch.isnan(best_scales).sum() == 0, best_scales
 
-        return best_scales.detach().cpu()
+        return best_scales.detach().to(device)
 
     @override
     @torch.no_grad()
@@ -1329,12 +1350,31 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         # * Calibrate and quantize
         total_layers_quantized = 0
         for idx, module in enumerate(self.modules):  # * ☑️ Outer loop
+
+            # Check if the block exists already
+            if save_dir_path is not None:
+                # Dynamically get and filter sublayers based on the same exclusion logic
+                named_linears = exclude_layers_to_not_quantize(
+                    get_named_linears(module), self.modules_to_not_convert
+                )
+
+                if are_block_sublayers_quantized(
+                    block_module=module,
+                    block_idx=idx,
+                    save_dir=str(save_dir_path),
+                    modules_to_not_convert=self.modules_to_not_convert,
+                ):
+                    logger.info(
+                        f"⏭️ [Block {idx}] Skipping — all sublayers already quantized."
+                    )
+                    continue
+
             logger.info(
                 f"\n🔍 [Block {idx}/{len(self.modules)}] Processing {module.__class__.__name__}"
             )
             log_gpu_usage(
                 f"[calibrate] Block {idx} - before moving module to GPU"
-            )  # log VRAM
+            )  # ☑️ log VRAM
 
             # module = self.modules[idx] = self.modules[idx].to(
             #     device
@@ -1347,6 +1387,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 get_named_linears(module), self.modules_to_not_convert
             )
             name_to_layer = {v: k for k, v in named_linears.items()}
+
+            # todo: debug; delete later
+            logger.info(f"named_linear: {named_linears}")
 
             # 💡 Input features captured while module is on CPU
             input_feat = self._get_input_feat(module, named_linears)
@@ -1691,25 +1734,38 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
     def load_saved_layer_weights(self, load_dir_path: str) -> None:
         """
-        Load previously saved per-layer quantized weights (layer_0.pt, layer_1.pt, ...)
-        into `self.model` in memory. Does not save anything.
-
-        Args:
-            load_dir_path (str): Directory containing saved layer_*.pt files.
+        Loads sublayer weights in the exact order expected by the model,
+        using its internal layer structure to reconstruct filenames.
         """
-        num_layers = len(self.model.model.layers)
+        from awq.utils.module import get_named_linears
 
-        logger.info(f"📥 Loading {num_layers} layers from {load_dir_path}")
+        if not os.path.isdir(load_dir_path):
+            raise FileNotFoundError(f"❌ Directory does not exist: {load_dir_path}")
 
-        for i in range(num_layers):
-            layer_path = os.path.join(load_dir_path, f"layer_{i}.pt")
-            if not os.path.exists(layer_path):
-                raise FileNotFoundError(f"Missing: {layer_path}")
-            state_dict = torch.load(layer_path, map_location="cpu")
-            self.model.model.layers[i].load_state_dict(state_dict)
-            logger.info(f"✅ Loaded layer_{i}.pt into model")
+        logger.info(
+            f"📥 Loading quantized sublayers from {load_dir_path} using model structure."
+        )
 
-        logger.info("🔗 All layers loaded into memory. Ready for inference or export.")
+        loaded_count = 0
+        for block_idx, block in enumerate(self.model.model.layers):
+            named_linears = get_named_linears(block)
+            for name, layer in named_linears.items():
+                filename = f"model.layers.{block_idx}.{name}.pt"
+                filepath = os.path.join(load_dir_path, filename)
+                if not os.path.exists(filepath):
+                    logger.warning(f"⚠️ Missing: {filename}")
+                    continue
+                try:
+                    state_dict = torch.load(filepath, map_location="cpu")
+                    layer.load_state_dict(state_dict)
+                    logger.debug(
+                        f"✅ Loaded {filename} into model.layers.{block_idx}.{name}"
+                    )
+                    loaded_count += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to load {filename}: {e}")
+
+        logger.info(f"✅ Loaded {loaded_count} quantized sublayers into model.")
 
     def save_quantized_and_configs(
         self,
@@ -1821,3 +1877,182 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.info(f"Quantized model saved successfully to {save_dir}")
         except Exception as e:
             logger.error(f"Error while saving quantized model: {e}")
+
+    # todo: commented out; this code computed a 1D vector for each group
+    # todo: delete later
+    # def _compute_best_scale_groupwise_old_version(
+    #     self,
+    #     x: torch.Tensor,
+    #     w_mean: torch.Tensor,
+    #     x_mean: torch.Tensor,
+    #     module2inspect: torch.nn.Module,
+    #     linears2scale: List[nn.Linear],
+    #     fp16_output: torch.Tensor,
+    #     group_idx: int,  # ✔️ Added to autoawq code
+    #     group_size: int,  # ✔️ Added to autoawq code
+    #     kwargs: Dict = {},
+    # ):
+    #     """
+    #     * Replace official autoawq's _compute_best_scale method to accomodate
+    #     * per group calculation efficiently.
+
+    #     Compute loss and select best scales
+
+    #     L(s) = || Q(W * s) (s^-1 * X) - W * X ||
+    #     Q: weight quantization function | pseudo_quantize_tensor(W * s)
+    #     X: inputs from calib dataset    | X
+    #     W: original weights in FP16     | layer
+    #     s: per channel scaling factor   | s^-1 * X
+
+    #     Grid search to find the best quantization scale for a specific input group.
+
+    #     This method evaluates candidate scales for a single input group (specified
+    #     by `group_idx`) by temporarily modifying the corresponding slice of weight
+    #     matrices in `linears2scale`. The modified layer(s) are then used in a forward
+    #     pass to compute the quantized output, which is compared against the original
+    #     FP16 output to compute reconstruction loss.
+
+    #     Args:
+    #         x (torch.Tensor): Full input tensor to the layer (shape: [B, in_features]).
+    #         w_mean (torch.Tensor): Per-output-channel mean of normalized weights
+    #             for this group (shape: [out_features]).
+    #         x_mean (torch.Tensor): Scalar input mean for this group, broadcasted
+    #             per output channel (shape: [out_features]).
+    #         module2inspect (nn.Module): The module to forward for computing
+    #             the quantized output.
+    #             Typically a single Linear layer, but can also be a higher-level container.
+    #         linears2scale (List[nn.Linear]): List of Linear layers in which the scale
+    #             should be applied.
+    #             Usually contains a single layer.
+    #         fp16_output (torch.Tensor): Original output of the unquantized full layer
+    #             (shape: [B, out_features]), used as the target for loss comparison.
+    #         group_idx (int): Index of the input group currently being quantized.
+    #         group_size (int): Number of input dimensions in each group.
+    #         kwargs (Dict, optional): Additional keyword arguments passed to the module's
+    #             forward method (e.g., attention masks). Defaults to empty.
+
+    #     Returns:
+    #         torch.Tensor: Optimal scale vector for this group, per output channel
+    #         (shape: [out_features]).
+    #     """
+    #     start = group_idx * group_size
+    #     end = (group_idx + 1) * group_size
+
+    #     history = []
+    #     best_ratio = -1
+    #     best_scales = None
+    #     best_error = float("inf")
+
+    #     # Set n grid and tolerance depending on tensor size
+    #     if fp16_output.shape[-1] >= 8192:  # For big MLPs like gate_proj/down_proj
+    #         n_grid = 10
+    #         early_stop_tolerance = 1.001
+    #     else:
+    #         n_grid = 20
+    #         early_stop_tolerance = 1.05
+    #     # todo: delete later
+    #     # org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+
+    #     # Cache original weights directly instead of full state_dict
+    #     original_weights = {
+    #         fc: fc.weight[:, group_idx * group_size : (group_idx + 1) * group_size]
+    #         .detach()
+    #         .clone()
+    #         for fc in linears2scale
+    #     }
+
+    #     # todo: no need to call to cpu inside the loop
+    #     # x = x.to("cpu")
+    #     # fp16_output = fp16_output.to("cpu")
+    #     # for fc in linears2scale:
+    #     #     fc.cpu()
+
+    #     # Move to the right device
+    #     device = x.device
+    #     x_mean = x_mean.view(-1).to(device)
+    #     w_mean = w_mean.view(-1).to(device)
+    #     fp16_output = fp16_output.to(device)
+
+    #     assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"  # extra guard
+    #     assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"  # extra guard
+
+    #     for ratio_idx in range(n_grid):
+    #         # create new scales
+    #         ratio = ratio_idx / n_grid
+
+    #         # NOTE: s^-1 * x is fused here, according to paper
+    #         if self.duo_scaling:
+    #             # 🧠 Core AWQ scaling: balances input and weight magnitudes
+    #             scales = (
+    #                 x_mean.pow(ratio_idx) / (w_mean.pow(1 - ratio_idx) + 1e-4)
+    #             ).clamp(min=1e-4)
+    #         else:
+    #             # 🛡 Fallback if dual scaling is off: normalize x_mean-based scales
+    #             scales = x_mean.pow(ratio_idx).clamp(min=1e-4)
+    #             scales = scales / (scales.mean(dim=-1, keepdim=True) + 1e-6)
+
+    #         scales = scales.clamp(min=1e-4, max=10.0)  # extra clamping to prevent drift
+    #         scales_view = scales.view(-1, 1).to(
+    #             device
+    #         )  # ☑️ updated: flip dim to broadcast across num of groups input dims
+
+    #         # avoid scaling values that overflow
+    #         scales[torch.isinf(scales)] = 1
+    #         scales[torch.isnan(scales)] = 1
+
+    #         # Q(W * s)
+    #         # inplace quantization + manual restore (no state_dict reload)
+    #         for fc in linears2scale:
+    #             with torch.no_grad():
+    #                 # Restore original slice
+    #                 fc.weight[:, start:end].copy_(original_weights[fc])
+    #                 # Apply scaling and quantization
+    #                 fc.weight[:, start:end].mul_(scales_view)
+    #                 fc.weight[:, start:end].copy_(
+    #                     self.pseudo_quantize_tensor(fc.weight[:, start:end])[0]
+    #                     / scales_view
+    #                 )
+
+    #             # todo: commented out; too computational intensive
+    #             # fc.weight[:, start:end].mul_(scales_view)  # ☑️ updated to slice weights
+    #             # fc.weight.data[:, start:end] = (
+    #             #     self.pseudo_quantize_tensor(fc.weight.data[:, start:end])[0]
+    #             #     / scales_view
+    #             # )  # ☑️ updated to slice weights
+    #             # logger.debug(f"Group {group_idx}: scale shape = {scales_view.shape}")
+
+    #         # W * X
+    #         int_w_output = self._module_forward(x, module2inspect, kwargs)
+    #         int_w_output = int_w_output.clip(
+    #             torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max
+    #         )  # clamp
+    #         int_w_output = int_w_output.to(device)  # ☑️ use dynamic device
+
+    #         # compute mean squared error (L2 norm)
+    #         loss = self._compute_loss(fp16_output, int_w_output, device)
+
+    #         history.append(loss)
+    #         if loss < best_error:
+    #             best_error = loss
+    #             best_ratio = ratio_idx
+    #             best_scales = scales.clone()
+    #             logger.debug(
+    #                 f"[Group {group_idx}] New best ratio = {ratio:.3f}, loss = {loss:.6f}"
+    #             )
+    #         # module2inspect.load_state_dict(org_sd) # No need to load this
+
+    #         # ✅ Early stopping if loss isn't improving much
+    #         elif loss > best_error * early_stop_tolerance:
+    #             logger.debug(
+    #                 f"[Group {group_idx}] Early exit at ratio {ratio:.3f}, loss = {loss:.6f}"
+    #             )
+    #             break
+
+    #     if best_ratio == -1:
+    #         logger.error(f"No valid scale found for group. Loss history: {history}")
+    #         raise Exception
+
+    #     assert best_scales is not None  # Add extra guard
+    #     assert torch.isnan(best_scales).sum() == 0, best_scales
+
+    #     return best_scales.detach().to(device)

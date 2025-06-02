@@ -50,7 +50,8 @@ models/
 Thumbs.db
 
 # Ignore documentation files
-docs/
+documents/
 
-# Ignore sandbox files
+# Ignore other files
 sandbox/
+artifacts/

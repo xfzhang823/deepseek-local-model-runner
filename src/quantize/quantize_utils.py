@@ -2,12 +2,14 @@
 
 import os
 import logging
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import Callable, Any, Dict, List, Tuple, Union, Optional
 import torch
 import torch.nn as nn
+from torch import Tensor
 from awq.modules.linear import WQLinear_GEMM
 from awq.utils.module import set_op_by_name
-from utils.find_layer_type import is_attention_layer
+
+# from utils.find_layer_type import is_attention_layer
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +164,51 @@ def flatten_scales_or_clip_list(
     return flattened
 
 
+def forward_with_memory_chunking(
+    module: Callable[[Tensor], Tensor],
+    inp: Tensor,
+    module_kwargs: Dict[str, Any],
+    max_chunk_memory: int,
+) -> Tensor:
+    """
+    Run a forward pass on a module with large input tensor using memory-aware chunking.
+
+    This function avoids GPU memory overflow by splitting the input into smaller chunks
+    that fit within the specified `max_chunk_memory` limit. It processes each chunk
+    sequentially, collects the outputs, and reconstructs the final output tensor.
+
+    Args:
+        module (Callable): A callable module (e.g., a linear layer) to apply to the input chunks.
+        inp (Tensor): Input tensor of shape [B, S, D] where B is batch size, S is sequence length,
+                      and D is input feature dimension.
+        module_kwargs (Dict[str, Any]): Additional keyword arguments to pass into the module.
+        max_chunk_memory (int): Maximum chunk memory in bytes (e.g., 64 * 1024 * 1024 for 64MB).
+
+    Returns:
+        Tensor: Output tensor of shape [B, S, ...], preserving batch and sequence dimensions.
+    """
+    # Flatten temporal dimension: [B, S, D] → [B*S, D]
+    inp_flat = inp.view(-1, inp.shape[-1])
+
+    # Estimate sizes
+    num_rows = inp_flat.size(0)
+    num_cols = inp_flat.size(1)
+    element_size = inp_flat.element_size()  # in bytes (e.g., 2 for float16)
+
+    # Calculate max rows per chunk to stay within memory budget
+    chunk_size = max(1, max_chunk_memory // (element_size * num_cols))
+
+    outputs: List[Tensor] = []
+    for i in range(0, num_rows, chunk_size):
+        chunk_inp = inp_flat[i : i + chunk_size].to(inp.device)
+        out_chunk = module(chunk_inp, **module_kwargs)
+        outputs.append(out_chunk.cpu())  # offload to CPU immediately
+        torch.cuda.empty_cache()
+
+    # Reconstruct final output: [B*S, ...] → [B, S, ...]
+    return torch.cat(outputs, dim=0).to(inp.dtype).view(inp.shape[0], inp.shape[1], -1)
+
+
 def get_safe_parallel_sample_count() -> int:
     """
     Get the SAFE no. of parallel sample, given the device's vram.
@@ -174,69 +221,6 @@ def get_safe_parallel_sample_count() -> int:
         return 8
     else:
         return 16
-
-
-def safe_update(
-    target_list: List[Tuple[str, torch.Tensor]] | None,
-    source: List[Tuple[str, torch.Tensor]],
-    name: str = "scales",
-    strict: bool = False,
-) -> None:
-    """
-    Safely updates a target list with source list of (str, Tensor) pairs.
-
-    Args:
-        target_list (List[Tuple[str, torch.Tensor]]): The list to extend.
-        source (List[Tuple[str, torch.Tensor]]): The source list of tuples.
-        name (str, optional): Name for logging (e.g., "scales" or "clips").
-            Defaults to "scales".
-        strict (bool, optional): Whether to raise an error if structure is invalid.
-            Defaults to False.
-
-    Raises:
-        TypeError: If strict=True and source is not a list of tuples.
-        ValueError: If strict=True and source cannot be extended.
-    """
-    if not isinstance(source, list):
-        message = (
-            f"❌ [calibrate] {name}_list is not a list. Got {type(source)} instead."
-        )
-        if strict:
-            logger.error(message)
-            raise TypeError(f"{name}_list must be a list after processing.")
-        else:
-            logger.warning(message)
-            return
-
-    try:
-        # Ensure the structure is List[Tuple[str, Tensor]]
-        for entry in source:
-            if not (
-                isinstance(entry, tuple)
-                and len(entry) == 2
-                and isinstance(entry[0], str)
-                and isinstance(entry[1], torch.Tensor)
-            ):
-                raise ValueError(f"Invalid entry in {name}_list: {entry}")
-
-        # Extend the target list
-        target_list.extend(source)
-        logger.info(
-            f"✅ [calibrate] {name.capitalize()} updated successfully with {len(source)} entries."
-        )
-
-    except Exception as e:
-        message = f"❌ [calibrate] Failed to update {name} due to structure issue: {e}"
-        if strict:
-            logger.error(message)
-            raise ValueError(
-                f"{name}_list structure is invalid. Expected List[Tuple[str, Tensor]]."
-            )
-        else:
-            logger.warning(message)
-            logger.warning(
-                f"🔍 [calibrate] Problematic {name}_list sample: {source[:5]}"
-            )
 
 
 def inspect_calib_stats(path: str):
@@ -306,7 +290,7 @@ def load_quantized_layers_into_model(
     group_size: int,
     in_features: int,
     out_features: int,
-    device: str = "cpu",
+    device: str = "gpu",
 ) -> nn.Module:
     """
     Load quantized layers from disk and insert them into the model.
@@ -399,6 +383,28 @@ def move_module_to_device(
             logger.debug("   ↳ Moved rotary_emb.sin_cached to device")
 
 
+def move_rope_to_device(
+    model: torch.nn.Module, device: Union[str, torch.device]
+) -> None:
+    """
+    Move rotary position embeddings (RoPE) to the specified device, if present.
+
+    Args:
+        model: The top-level model (may contain .model submodule).
+        device: Target device (e.g., "cuda:0" or torch.device).
+    """
+    try:
+        device = torch.device(device)  # ✅ Coerce to torch.device
+        transformer = getattr(model, "model", model)
+        if hasattr(transformer, "rotary_emb"):
+            rope = transformer.rotary_emb
+            if rope.device != device:
+                transformer.rotary_emb = rope.to(device)
+                logging.info(f"🔁 [RoPE] Moved rotary_emb to {device}")
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to move rotary_emb to {device}: {e}")
+
+
 def persist_quantized_layer(
     quant_layer: WQLinear_GEMM,
     save_dir: str,
@@ -455,6 +461,69 @@ def persist_quantized_layer(
         return None
 
 
+def safe_update(
+    target_list: List[Tuple[str, torch.Tensor]] | None,
+    source: List[Tuple[str, torch.Tensor]],
+    name: str = "scales",
+    strict: bool = False,
+) -> None:
+    """
+    Safely updates a target list with source list of (str, Tensor) pairs.
+
+    Args:
+        target_list (List[Tuple[str, torch.Tensor]]): The list to extend.
+        source (List[Tuple[str, torch.Tensor]]): The source list of tuples.
+        name (str, optional): Name for logging (e.g., "scales" or "clips").
+            Defaults to "scales".
+        strict (bool, optional): Whether to raise an error if structure is invalid.
+            Defaults to False.
+
+    Raises:
+        TypeError: If strict=True and source is not a list of tuples.
+        ValueError: If strict=True and source cannot be extended.
+    """
+    if not isinstance(source, list):
+        message = (
+            f"❌ [calibrate] {name}_list is not a list. Got {type(source)} instead."
+        )
+        if strict:
+            logger.error(message)
+            raise TypeError(f"{name}_list must be a list after processing.")
+        else:
+            logger.warning(message)
+            return
+
+    try:
+        # Ensure the structure is List[Tuple[str, Tensor]]
+        for entry in source:
+            if not (
+                isinstance(entry, tuple)
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], torch.Tensor)
+            ):
+                raise ValueError(f"Invalid entry in {name}_list: {entry}")
+
+        # Extend the target list
+        target_list.extend(source)
+        logger.info(
+            f"✅ [calibrate] {name.capitalize()} updated successfully with {len(source)} entries."
+        )
+
+    except Exception as e:
+        message = f"❌ [calibrate] Failed to update {name} due to structure issue: {e}"
+        if strict:
+            logger.error(message)
+            raise ValueError(
+                f"{name}_list structure is invalid. Expected List[Tuple[str, Tensor]]."
+            )
+        else:
+            logger.warning(message)
+            logger.warning(
+                f"🔍 [calibrate] Problematic {name}_list sample: {source[:5]}"
+            )
+
+
 def unwrap_to_transformer(model: nn.Module) -> nn.Module:
     """
     Utils function to extract models from wrappers (common structure among LLMs).
@@ -479,25 +548,3 @@ def unwrap_to_transformer(model: nn.Module) -> nn.Module:
         raise AttributeError(
             "Could not unwrap model to transformer. Unexpected structure."
         )
-
-
-def move_rope_to_device(
-    model: torch.nn.Module, device: Union[str, torch.device]
-) -> None:
-    """
-    Move rotary position embeddings (RoPE) to the specified device, if present.
-
-    Args:
-        model: The top-level model (may contain .model submodule).
-        device: Target device (e.g., "cuda:0" or torch.device).
-    """
-    try:
-        device = torch.device(device)  # ✅ Coerce to torch.device
-        transformer = getattr(model, "model", model)
-        if hasattr(transformer, "rotary_emb"):
-            rope = transformer.rotary_emb
-            if rope.device != device:
-                transformer.rotary_emb = rope.to(device)
-                logging.info(f"🔁 [RoPE] Moved rotary_emb to {device}")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to move rotary_emb to {device}: {e}")
