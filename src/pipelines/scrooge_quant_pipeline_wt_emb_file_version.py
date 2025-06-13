@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizer
 from quantize.scrooge_awq_quantizer import ScroogeAwqQuantizer
 from quantize.embed_batches_with_cache import embed_batches_with_cache
 import logging_config
-from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR
+from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def load_project_config() -> Tuple[str, str, str, Path]:
     if hf_token is None:
         raise ValueError("HUGGING_FACE_TOKEN must be set")
 
-    out_dir = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR)
+    out_dir = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR)
     os.makedirs(out_dir, exist_ok=True)
 
     # This must always happen unconditionally before return
@@ -111,7 +111,7 @@ def scrooge_quant_pipeline(
     if base_model is None:
         raise ValueError("Base model must be provided or set in environment.")
 
-    save_dir_path = save_dir_path or str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_SCROOGE_DIR)
+    save_dir_path = save_dir_path or str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR)
     save_layers_dir = save_layers_dir or save_dir_path
 
     logger.info(f"Using base model: {base_model}")

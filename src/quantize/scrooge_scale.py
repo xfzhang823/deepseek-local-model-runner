@@ -6,13 +6,13 @@ Custom version of the official code to apply scales to a single layer.
 
 import re
 import logging
-from typing import List, Tuple, Optional, Dict, cast
+from typing import List, Tuple, Optional, Dict, cast, Union
 import torch
 import torch.nn as nn
 from awq.utils.utils import get_best_device
 from awq.modules.act import ScaledActivation
-from awq.utils.module import get_op_by_name, set_op_by_name, get_op_name
-from awq.quantize.scale import scale_fc_fc, scale_gelu_fc
+from awq.utils.module import get_op_by_name, get_op_name
+from awq.quantize.scale import scale_gelu_fc
 from transformers.models.bloom.modeling_bloom import BloomGelu
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
@@ -38,11 +38,6 @@ allowed_act_fns = [
 ]
 
 
-import torch
-import torch.nn as nn
-from typing import Dict, List, Union
-
-
 def normalize_scales_across_groups(
     layers: List[Union[nn.Linear, Tuple[nn.Linear, slice]]],
     name_to_layer: Dict[Union[nn.Linear, Tuple[nn.Linear, slice]], str],
@@ -50,65 +45,40 @@ def normalize_scales_across_groups(
     epsilon: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """
-    Normalize group-wise scales across Q/K/V projections that share input.
-    Supports both:
-    - Separate layers (each scale is [O, G])
-    - Fused layers using weight slices (e.g., query_key_value), scale sliced accordingly.
+    Normalize 1D scalar group-wise scales across layers that share input.
+    Assumes each layer's scale is a 1D tensor of shape [G].
 
     Args:
-        layers: List of nn.Linear layers or (layer, slice) for fused QKV
-        name_to_layer: Dict mapping layer or (layer, slice) → name
-        scales_dict: Dict name → scale tensor (shape [O, G])
-        epsilon: Small constant for numerical stability
-        group_size: Number of input dims per group
+        layers: List of nn.Linear layers or (layer, slice) for fused QKV.
+        name_to_layer: Mapping from layer or (layer, slice) to layer name.
+        scales_dict: Dict from layer name to 1D scale tensor.
+        epsilon: Stability constant.
 
     Returns:
-        Updated scales_dict with normalized scales
+        Updated scales_dict with group-wise normalized scales.
     """
     per_group_max = {}
 
     for entry in layers:
         name = name_to_layer[entry]
+        scale = scales_dict[name]
+        assert scale.dim() == 1, f"{name} must be 1D [G], got {scale.shape}"
+        per_group_max[name] = scale.abs().tolist()
 
-        if isinstance(entry, tuple):
-            layer, sl = entry
-            weight = layer.weight.detach()[sl]  # [O, I]
-            scale = scales_dict[name]
-        else:
-            layer = entry
-            weight = layer.weight.detach()  # [O, I]
-            scale = scales_dict[name]
-
-        assert scale.dim() == 2, f"{name} must be 2D [O, G], got {scale.shape}"
-        O, I = weight.shape
-        G = scale.shape[1]
-        assert I % G == 0, f"Invalid group size: in_features={I}, groups={G}"
-        gsize = I // G
-
-        per_group_max[name] = []
-        for g in range(G):
-            w = weight[:, g * gsize : (g + 1) * gsize]
-            s = scale[:, g].view(-1, 1)
-            max_val = (w / (s + epsilon)).abs().max().item()
-            per_group_max[name].append(max_val)
-
-    # Step 2: For each group index, get shared max across layers
     G = len(next(iter(per_group_max.values())))
     shared_max = [
         max(per_group_max[name][g] for name in per_group_max) for g in range(G)
     ]
 
-    # Step 3: Normalize each layer's scale
+    # Normalize each scale
     for entry in layers:
         name = name_to_layer[entry]
         scale = scales_dict[name]
         current_max = per_group_max[name]
-
         normed = torch.empty_like(scale)
         for g in range(G):
             ratio = current_max[g] / (shared_max[g] + epsilon)
-            normed[:, g] = scale[:, g] * ratio
-
+            normed[g] = scale[g] * ratio
         scales_dict[name] = normed
 
     return scales_dict

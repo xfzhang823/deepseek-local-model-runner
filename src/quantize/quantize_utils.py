@@ -524,6 +524,18 @@ def safe_update(
             )
 
 
+def tensor_preview(t: torch.Tensor, rows: int = 3, cols: int = 3) -> str:
+    try:
+        if t.ndim == 1:
+            return str(t[:rows].tolist())
+        elif t.ndim == 2:
+            return str(t[:rows, :cols].tolist())
+        else:
+            return f"Tensor of shape {tuple(t.shape)} — not previewed"
+    except Exception as e:
+        return f"[Tensor logging error: {e}]"
+
+
 def unwrap_to_transformer(model: nn.Module) -> nn.Module:
     """
     Utils function to extract models from wrappers (common structure among LLMs).
