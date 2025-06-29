@@ -213,7 +213,8 @@ def run_scrooge_quant_pipeline(
 
         log_resource_snapshot("BEFORE_CALIBRATE")
         quantizer.calibrate_and_quantize(
-            save_dir_path=save_layers_dir, use_full_calib=False
+            save_dir_path=save_layers_dir,
+            use_full_calib=False,  # ! Set to use simple calibration
         )
         log_resource_snapshot("AFTER_CALIBRATE")
 

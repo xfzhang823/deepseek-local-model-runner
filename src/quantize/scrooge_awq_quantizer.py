@@ -693,31 +693,32 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         ┌────────────────────────────────────────────────────┐
         │        Input: layer.weight ∈ [O, I]                │
         └────────────────────────────────────────────────────┘
-                            │
-                            ▼
+                        │
+                        ▼
         ┌────────────────────────────────────────────────────┐
         │  Step 1: Group weights by input dim                │
         │  weight_grouped ∈ [O, G, group_size]               │
-        │  w_group_mean ∈ [O] per group                      │
+        │  w_group_mean ∈ [group_size] per group             │
         └────────────────────────────────────────────────────┘
-                            │
-                            ▼
+                        │
+                        ▼
         ┌────────────────────────────────────────────────────┐
-        │  Step 2: Compute x_mean per group ∈ [G]            │
-        │  Expand to x_mean ∈ [O]                            │
+        │  Step 2: Compute x_mean per group ∈ [group_size]   │
+        │  (one per group, no expansion to [O])              │
         └────────────────────────────────────────────────────┘
-                            │
-                            ▼
+                        │
+                        ▼
         ┌────────────────────────────────────────────────────┐
         │  Step 3: Forward pass                              │
         │  fp16_output ∈ [B, O]                              │
         └────────────────────────────────────────────────────┘
-                            │
-                            ▼
+                        │
+                        ▼
         ┌────────────────────────────────────────────────────┐
         │  Step 4: Optimize scalar scale per group           │
         │  scales ∈ [G] (1 value per group)                  │
         └────────────────────────────────────────────────────┘
+
         """
         layer_name = get_op_name(module, layer)
         module2inspect = module2inspect or layer
@@ -741,41 +742,58 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         # 🟩 Ensure layer is on forward device
         layer.to(forward_device)
 
-        # --- STEP 1: Compute grouped weight mean ---
+        # * --- STEP 1: Load in weights and prelimenary checks ---
         try:
             weight = layer.weight.detach()  # create a copy of the weights
             out_features, in_features = weight.shape  # get dim (for reshaping)
 
+            # Check if layer dim is divisible by group size
             if in_features % self.group_size != 0:
                 raise ValueError(
                     f"[{layer_name}] in_features={in_features} not divisible by group_size={self.group_size}"
                 )
 
             num_groups = in_features // self.group_size
-            weight_grouped = weight.view(
-                out_features, num_groups, self.group_size
-            )  # * Reshape weights
 
             # Logging for debug
-            logger.info(f"weight shape = {weight.shape}")
-            logger.info(f"num_groups: {num_groups}")
-            logger.info(f"[{layer_name}] weight_grouped shape: {weight_grouped.shape}")
             logger.info(
-                f"[{layer_name}] weight_grouped preview [:3, 0, :5]: {weight_grouped[:3, 0, :5].tolist()}"
+                f"Original weight shape [out_feature, in_feature] = {weight.shape}"
             )
-
-            clear_memory(weight_grouped)
+            logger.info(f"num_groups: {num_groups}")
 
         except Exception as e:
             logger.error(f"[{layer_name}] Error during weight scale computation: {e}")
             raise
 
-        # --- STEP 2: Compute input mean (per input channel), chunked to avoid OOM
+        # * --- STEP 2: Reshape weights to [O, G, group_size]
+        try:
+            # Imitating a slighly older version of the autoawq code (logic still the same)
+            weight_grouped = weight.view(
+                out_features, num_groups, self.group_size
+            )  # [O, G, group_size]
+
+            # Normalize weights per group
+            w_max = weight_grouped.abs().amax(dim=2, keepdim=True) + 1e-6  # [O, G, 1]
+            w_scaled = weight_grouped.abs() / w_max  # [O, G, group_size]
+
+            # Compute mean across input channels in each group
+            w_mean = w_scaled.mean(dim=2)  # [O, G]
+
+            # Transpose
+            w_mean = w_mean.transpose(0, 1)  # [G, O]
+
+        except Exception as e:
+            logger.error(f"[{layer_name}] Error during w_mean computation: {e}")
+            raise
+
+        # * --- STEP 3: Compute input mean (per input channel), chunked to avoid OOM
         try:
             # ✅ run on calibration_device
-            inp_flat = inp.to(calibration_device).abs().view(-1, inp.shape[-1])
-            num_elements = inp_flat.size(0)
-            num_channels = inp_flat.size(1)
+            inp_flat = (
+                inp.to(calibration_device).abs().view(-1, inp.shape[-1])
+            )  # Flatten B and T -> [B*T, I]
+            num_elements = inp_flat.size(0)  # rows (B*T)
+            num_channels = inp_flat.size(1)  # column (input channel)
             chunk_size = min(
                 self.max_chunk_memory // (inp_flat.element_size() * 2 * num_channels),
                 num_elements,
@@ -784,22 +802,28 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             x_sum = torch.zeros(
                 num_channels, dtype=torch.float32, device=calibration_device
             )  # setup holder; calibrate on cpu
-            for i in range(0, num_elements, chunk_size):
+            for i in range(
+                0, num_elements, chunk_size
+            ):  # Compute x_sum (for averaging)
                 end = min(i + chunk_size, num_elements)
-                x_sum += inp_flat[i:end].to(torch.float32).sum(dim=0)
+                x_sum += inp_flat[i:end].to(torch.float32).sum(dim=0)  # [I]
 
-            # Project input activation mean into output channels
+            # Final mean over all tokens
             x_mean_flat = (
                 (x_sum / num_elements).to(inp.dtype).to(forward_device)
-            )  # [in_features]; forward on gpu
-            x_mean_grouped = x_mean_flat.view(num_groups, self.group_size).mean(
-                dim=1
-            )  # [num_groups]
+            )  # [I (in_features)]; forward on gpu
 
-            # todo: commented out for now; delete later
-            # x_mean_broadcasted = x_mean_grouped.expand(
-            #     out_features, -1
-            # ).contiguous()  # [O, G]
+            # Reshape into [G, group_size]
+            x_mean_grouped = x_mean_flat.view(
+                num_groups, self.group_size
+            )  # [G, group_size]
+
+            # Broadcast to output channels (broadcast group-level mean per output)
+            # This produces [O, G] by computing the average per group, repeated for each output channel
+            x_mean_grouped = x_mean_grouped.mean(dim=1)  # [G]
+            x_mean_grouped = (
+                x_mean_grouped.unsqueeze(0).expand(num_channels, -1).contiguous()
+            )  # [G, 0]
 
             clear_memory(x_sum)
 
@@ -809,7 +833,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         log_gpu_usage("[fp16_output] BEFORE forward pass")  # ⬅️ VRAM logging
 
-        # --- STEP 3: Forward pass for FP16 output ---
+        # * --- STEP 3: Forward pass for FP16 output ---
         try:
             module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
             fp16_output = forward_with_memory_chunking(
@@ -843,33 +867,32 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.error(f"[{layer_name}] Forward pass failed: {e}")
             raise
 
-        # --- STEP 4: Search best scale per group → returns scalar per group ---
-        # --- Compute best scale via grid search ---
+        # * --- STEP 4: Search best scale per group → returns scalar per group ---
+        # * --- Compute best scale via grid search ---
 
-        # Prepare the final scale tensor
+        # setup holder
         scales = torch.zeros(
-            num_groups, dtype=torch.float16, device=forward_device
-        )  # setup holder
-        # self.duo_scaling = True  # Comment out for now/not needed
+            num_groups, self.group_size, dtype=torch.float16, device=forward_device
+        )  # [G, group_size]
 
-        # iterate over each group
+        # iterate over each group (using loop for memory safety)
         for g in range(num_groups):
-            start, end = g * self.group_size, (g + 1) * self.group_size
-            x_group_mean = x_mean_grouped[g].expand(out_features)  # [O]
-            w_group = weight[:, start:end]
-            w_max = w_group.abs().amax(dim=1, keepdim=True) + 1e-6
-            w_scaled = w_group.abs() / w_max
-            w_group_mean = w_scaled.mean(dim=1)  # [O]
+            # w and x for each group
+            w_mean_group = w_mean[g]  # [O]
+            x_mean_group = x_mean[g]  # shape: [group_size]
 
             log_gpu_usage(
                 f"[{layer_name}] Group {g}: before scale search"
             )  # ☑️ # Log VRAM
 
+            logger.debug(f"w_mean_group shape == {w_mean_group.shape}")
+            logger.debug(f"x_mean_group shape == {x_mean_group.shape}")
+
             # Call your per-group scale search
             best_scale_per_group = self._compute_best_scale_groupwise(
                 x=inp,  # full input
-                w_mean=w_group_mean,  # per group only
-                x_mean=x_group_mean,  # per group only
+                w_mean=w_mean_group,  # per group only
+                x_mean=x_mean_group,  # per group only
                 module2inspect=layer,  # full layer (layer for pass forward)
                 linears2scale=[layer],  # full layer (layer to calib scales)
                 fp16_output=fp16_output,  # full layer output
@@ -882,10 +905,10 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 f"[{layer_name}] Group {g}: after scale search"
             )  # ☑️ VRAM logging
             logger.debug(
-                f"[{layer_name}] Group {g} scale: {best_scale_per_group.item():.6f}"
+                f"[{layer_name}] Group {g} scale preview: {best_scale_per_group[:5].tolist()}"
             )
 
-            scales[g] = best_scale_per_group.mean().item()
+            scales[g, :] = best_scale_per_group  # ✅ [G, group_size]
 
         # Logging and shape check
         logger.debug(
@@ -897,7 +920,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         assert scales.shape == (
             num_groups,
-        ), f"Expected 1D scale per group, got {scales.shape}"
+            self.group_size,
+        ), f"Expected 2D scale per group, got {scales.shape}"
 
         del inp, fp16_output
         clear_memory()
@@ -919,47 +943,48 @@ class ScroogeAwqQuantizer(AwqQuantizer):
     ):
         """
         * Replace official autoawq's _compute_best_scale method to accomodate
-        * per group calculation efficiently.
+        * group iteration (to save memory)
 
-        Compute loss and select best scales
+        Efficient per-group scale search using AutoAWQ-style duo scaling.
 
-        L(s) = || Q(W * s) (s^-1 * X) - W * X ||
-        Q: weight quantization function | pseudo_quantize_tensor(W * s)
-        X: inputs from calib dataset    | X
-        W: original weights in FP16     | layer
-        s: per channel scaling factor   | s^-1 * X
+        This method replaces AutoAWQ's original `_compute_best_scale` to perform
+        quantization calibration for a specific input group using grid search over
+        scaling ratios.
 
-        Grid search to find the best quantization scale for a specific input group.
+        It minimizes the reconstruction loss between the quantized and original
+        outputs by testing candidate scale values derived from a fused formula:
 
-        This method evaluates candidate scales for a single input group (specified
-        by `group_idx`) by temporarily modifying the corresponding slice of weight
-        matrices in `linears2scale`. The modified layer(s) are then used in a forward
-        pass to compute the quantized output, which is compared against the original
-        FP16 output to compute reconstruction loss.
+            s = (x_mean^r / w_mean^(1 - r))                     [Duo scaling]
+            L(s) = || Q(W * s) * (s^-1 * X) - W * X ||
+
+        Where:
+            - Q: weight quantization function (`pseudo_quantize_tensor`)
+            - W: original FP16 weights
+            - X: calibration inputs
+            - s: candidate scaling factor (scalar per group, or vector in full version)
+
+        The method iteratively applies scale candidates, quantizes the weights,
+        forwards the input through the modified layer(s), and compares the result
+        with the original output to find the best-performing scale.
 
         Args:
-            x (torch.Tensor): Full input tensor to the layer (shape: [B, in_features]).
+            x (torch.Tensor): Full input tensor to the layer [B, in_features].
             w_mean (torch.Tensor): Per-output-channel mean of normalized weights
-                for this group (shape: [out_features]).
-            x_mean (torch.Tensor): Scalar input mean for this group, broadcasted
-                per output channel (shape: [out_features]).
-            module2inspect (nn.Module): The module to forward for computing
-                the quantized output.
-                Typically a single Linear layer, but can also be a higher-level container.
-            linears2scale (List[nn.Linear]): List of Linear layers in which the scale
-                should be applied.
-                Usually contains a single layer.
-            fp16_output (torch.Tensor): Original output of the unquantized full layer
-                (shape: [B, out_features]), used as the target for loss comparison.
-            group_idx (int): Index of the input group currently being quantized.
-            group_size (int): Number of input dimensions in each group.
-            kwargs (Dict, optional): Additional keyword arguments passed to the module's
-                forward method (e.g., attention masks). Defaults to empty.
+                for the group [out_features].
+            x_mean (torch.Tensor): Per-output-channel mean of input activations
+                for the group [out_features].
+            module2inspect (nn.Module): Layer/module to perform forward pass.
+            linears2scale (List[nn.Linear]): Linear layers to apply the scale to.
+            fp16_output (torch.Tensor): Ground truth output from the full-precision layer
+                [B, out_features].
+            group_idx (int): Index of the current input group (0-based).
+            group_size (int): Size of each input group (must divide in_features evenly).
+            kwargs (Dict): Optional forward arguments for `module2inspect`.
 
         Returns:
-            torch.Tensor: Optimal scale vector for this group, per output channel
-            (shape: [out_features]).
+            torch.Tensor: Best scale (scalar) for this group [1-element tensor].
         """
+
         start = group_idx * group_size
         end = (group_idx + 1) * group_size
 
@@ -975,8 +1000,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         else:
             n_grid = 20
             early_stop_tolerance = 1.05
-        # todo: delete later
-        # org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
 
         # Cache original weights directly instead of full state_dict
         original_weights = {
@@ -986,54 +1009,75 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             for fc in linears2scale
         }
 
-        # todo: no need to call to cpu inside the loop
-        # x = x.to("cpu")
-        # fp16_output = fp16_output.to("cpu")
-        # for fc in linears2scale:
-        #     fc.cpu()
-
         # Move to the right device
         device = x.device
         x_mean = x_mean.view(-1).to(device)
         w_mean = w_mean.view(-1).to(device)
         fp16_output = fp16_output.to(device)
 
-        assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"  # extra guard
-        assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"  # extra guard
+        assert x_mean.shape == w_mean.shape, "x_mean and w_mean must match group size"
+        assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"
+        assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"
 
         w_slice = torch.cat([original_weights[fc] for fc in linears2scale], dim=0)
         std_anchor = w_slice.std().item()
         std_anchor = max(std_anchor, 1e-5)  # avoid zero or tiny
 
-        ratios = torch.linspace(0.25, 2.0, n_grid)
-        for ratio_idx, ratio in enumerate(ratios):
-            scale = ratio * std_anchor
-            scale = max(scale.item(), 1e-5)
+        # Use a different ratio system
+        if self.duo_scaling:
+            ratios = torch.linspace(0.25, 2.0, n_grid)
+        else:
+            ratios = torch.linspace(0.5, 1.5, n_grid)
 
-            # Quantize each layer
+        for ratio_idx, ratio in enumerate(ratios):
+            # AutoAWQ's fused duo-scaling formula: s = (x_mean^r / w_mean^(1-r))^(1/norm)
+            if self.duo_scaling:
+                scale_tensor = (
+                    x_mean.pow(ratio) / (w_mean.pow(1.0 - ratio) + 1e-4)
+                ).clamp(min=1e-4)
+            else:
+                scale_tensor = x_mean.pow(ratio).clamp(min=1e-4)
+
+            # Normalize the scale tensor to prevent dynamic range blowup
+            scale_tensor = (
+                scale_tensor / (scale_tensor.max() * scale_tensor.min()).sqrt()
+            )
+
+            # Ensure no NaN or Inf in scales
+            scale_tensor[torch.isnan(scale_tensor)] = 1.0
+            scale_tensor[torch.isinf(scale_tensor)] = 1.0
+
+            # scale_val = scale_tensor.mean().item()  # Collapse to scalar (mean)
+            # scale_val = max(scale_val, 1e-5)
+
+            # Apply pseudo-quantization for this scale
             for fc in linears2scale:
                 with torch.no_grad():
-                    fc.weight[:, start:end].copy_(original_weights[fc])  # restore
                     fc.weight[:, start:end].copy_(
-                        self.pseudo_quantize_tensor(fc.weight[:, start:end] / scale)[0]
-                        * scale
+                        original_weights[fc]
+                    )  # Restore original
+                    fc.weight[:, start:end].copy_(
+                        self.pseudo_quantize_tensor(
+                            fc.weight[:, start:end] / scale_tensor
+                        )[0]
+                        * scale_tensor
                     )
 
-            # Forward + error
             int_w_output = self._module_forward(x, module2inspect, kwargs).clamp(
                 torch.finfo(fp16_output.dtype).min, torch.finfo(fp16_output.dtype).max
             )
 
             loss = self._compute_loss(fp16_output, int_w_output, device)
-
             history.append(loss)
+
             if loss < best_error:
                 best_error = loss
                 best_ratio = ratio
-                best_scale = scale
+                best_scale = scale_tensor.clone()
                 logger.debug(
-                    f"[Group {group_idx}] New best scale = {scale:.6f}, loss = {loss:.6f}"
+                    f"[Group {group_idx}] New best scale (preview): {scale_tensor[:5].tolist()}, loss = {loss:.6f}"
                 )
+
             elif loss > best_error * early_stop_tolerance:
                 logger.debug(
                     f"[Group {group_idx}] Early exit at ratio {ratio:.3f}, loss = {loss:.6f}"
@@ -1046,7 +1090,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         assert best_scale is not None  # Add extra guard
 
-        return torch.tensor(best_scale, dtype=torch.float16, device=device)
+        return best_scale.to(dtype=torch.float16, device=device)
 
     @torch.no_grad()
     def _search_best_scale_per_channel(
@@ -1057,7 +1101,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         inp: torch.Tensor,
         module2inspect: Optional[nn.Module] = None,
         kwargs: Optional[dict] = None,
-    ) -> Tuple[str, Tuple[str], torch.Tensor]:
+    ) -> torch.Tensor:
         """
         * Full calibration!
 
@@ -1071,17 +1115,17 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         Args:
             module (nn.Module): Parent container (e.g., TransformerBlock).
-            prev_op (nn.Module): Previous op (e.g., LayerNorm, GELU) used for applying scale.
+            prev_op (nn.Module): Previous op (e.g., LayerNorm, GELU) used for
+                applying scale.
             layer (nn.Linear): Target Linear layer to calibrate.
             inp (torch.Tensor): Input tensor to the layer (typically float16).
-            module2inspect (Optional[nn.Module]): Module used during the forward pass (defaults to `layer`).
-            kwargs (Optional[dict]): Additional kwargs for the forward pass (e.g., attention mask).
+            module2inspect (Optional[nn.Module]): Module used during the forward
+                pass (defaults to `layer`).
+            kwargs (Optional[dict]): Additional kwargs for the forward pass
+                (e.g., attention mask).
 
         Returns:
-            Tuple[str, Tuple[str], torch.Tensor]:
-                - Name of the previous op (str)
-                - Target layer name (tuple with one str)
-                - Scale tensor of shape [out_features, num_groups] (float16 or bfloat16)
+            Scale tensor of shape [out_features, num_groups] (float16 or bfloat16)
 
         Steps:
         1. **Group and normalize weights**
@@ -1091,8 +1135,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         2. **Compute input means**
             - Input activation x ∈ [B, S, I]
-            - Compute mean per input group → x_mean ∈ [G]
-            - Broadcast to [O, G]
+            *- Compute mean per input group per channel → x_mean ∈ [O, G]
 
         3. **Forward pass**
             - Get reference fp16 output ∈ [B, O]
@@ -1134,7 +1177,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.info(f"num_groups: {num_groups}")
             logger.info(f"[{layer_name}] weight_grouped shape: {weight_grouped.shape}")
             logger.info(
-                f"[{layer_name}] weight_grouped preview [:3, 0, :5]: {weight_grouped[:3, 0, :5].tolist()}"
+                f"[{layer_name}] weight_grouped preview [:2, :2, :2]: {weight_grouped[:2, :2, :2].tolist()}"
             )
 
             clear_memory(weight_grouped)
@@ -1143,36 +1186,38 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             logger.error(f"[{layer_name}] Error during weight scale computation: {e}")
             raise
 
-        # --- STEP 2: Compute input mean (per input channel), chunked to avoid OOM
+        # * --- STEP 2: Compute input mean (per input channel), chunked to avoid OOM
         try:
-            inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])
-            num_elements = inp_flat.size(0)
-            num_channels = inp_flat.size(1)
+            # Flatten batch and sequence
+            inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])  # [B*S, I]
+
+            num_elements = inp_flat.size(0)  # B*S
+            num_channels = inp_flat.size(1)  # I
             chunk_size = min(
                 self.max_chunk_memory // (inp_flat.element_size() * 2 * num_channels),
                 num_elements,
             )
 
-            x_sum = torch.zeros(num_channels, dtype=torch.float32)
+            x_sum = torch.zeros(num_channels, dtype=torch.float32)  # [I]
             for i in range(0, num_elements, chunk_size):
                 end = min(i + chunk_size, num_elements)
                 x_sum += inp_flat[i:end].to(torch.float32).sum(dim=0)
 
             x_mean_flat = (
                 (x_sum / num_elements).to(inp.dtype).to(weight.device)
-            )  # [in_features]
-            x_mean_grouped = x_mean_flat.view(num_groups, self.group_size).mean(
-                dim=1
-            )  # [num_groups]
-            x_mean_broadcasted = x_mean_grouped.expand(
-                out_features, -1
-            ).contiguous()  # [O, G]
+            )  # [I] ([in_features])
+            x_mean_grouped = x_mean_flat.view(
+                num_groups, self.group_size
+            )  # [G, group_size]
+            x_mean_per_channel = x_mean_grouped.unsqueeze(0).expand(
+                out_features, -1, -1
+            )  # [O, G, C (channel per group/group size)] Store this and slice by group later inside the loop.
 
             logger.info(
-                f"[{layer_name}] x_mean_grouped shape = {x_mean_broadcasted.shape}"
+                f"[{layer_name}] x_mean_grouped per_channel_shape = {x_mean_per_channel.shape}"
             )
             logger.info(
-                f"[{layer_name}] weight_grouped preview [:3, 0, :3]: {x_mean_broadcasted[:3, :3].tolist()}"
+                f"[{layer_name}] x_mean_per_channel preview: {x_mean_per_channel[:2, :2].tolist()}"
             )
 
             clear_memory(x_sum)
@@ -1183,10 +1228,12 @@ class ScroogeAwqQuantizer(AwqQuantizer):
 
         log_gpu_usage("[fp16_output] BEFORE forward pass")  # ⬅️ VRAM logging
 
-        # --- STEP 3: Forward pass for FP16 output ---
+        # * --- STEP 3: Forward pass for FP16 output ---
         try:
             module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
-            fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
+            fp16_output = self._module_forward(
+                inp, module2inspect, module_kwargs
+            )  # [B*S, O]
 
             log_gpu_usage("[fp16_output] AFTER forward pass")  # ⬅️ VRAM logging
 
@@ -1194,6 +1241,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 torch.finfo(fp16_output.dtype).min,
                 torch.finfo(fp16_output.dtype).max,
             )
+
+            logger.debug(f"fp16_output shape == {fp16_output.shape}")
+
             fp16_output = fp16_output.to("cpu")
             torch.cuda.empty_cache()
 
@@ -1221,32 +1271,31 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         for g in range(num_groups):
             start, end = g * self.group_size, (g + 1) * self.group_size
 
-            # Slice inputs and weights for the group
-            x_per_group = inp[
-                :, :, start:end
-            ]  # ☑️ slicing in_features[B, sequence, group_size]
+            # # Slice inputs and weights for the group
+            # x_per_group = inp[:, start:end]  # ☑️ [B*S, group_size]
 
-            # todo: debug; delete later
-            if torch.isnan(x_per_group).any():
-                logger.error(
-                    f"[{layer_name}] Group {g} input (x_per_group) contains NaNs!"
-                )
-                raise ValueError("NaNs in input tensor during calibration.")
-            logger.info(f"x_per_group shape == {x_per_group.shape}")
+            # Extract precomputed input mean for group g
+            # Shape: [out_features, group_size]
+            x_mean_per_channel_per_group = x_mean_per_channel[:, g, :]
+            logger.info(
+                f"x_mean_per_channel_per_group shape == {x_mean_per_channel_per_group.shape}"
+            )
 
-            w_per_group = layer.weight[:, start:end]  # i.e., [1536, 128]
+            # Extract current weight group
+            w_per_group = layer.weight[
+                :, start:end
+            ]  # shape: [O, group_size], i.e., [1536, 128]
 
-            # Slice x_mean and compute group mean per input feature group
-            # x_mean = x_group.abs().mean(dim=0)  # [B, group_size]
-            # x_mean_grouped = x_mean.mean().expand(layer.out_features)  # [O, group_size]
+            # # Expand to match number of output channels (per output channel scaling)
+            # x_per_group_mean = x_per_group_mean.unsqueeze(0).expand(
+            #     layer.weight.shape[0], -1
+            # )  # shape: [O, group_size]
 
-            # Group-wise input activation average, broadcast per output channel
-            x_per_group_mean = (
-                x_per_group.abs().mean(dim=0).mean().expand(out_features)
-            )  # [O]
-            w_per_group_max = w_per_group.abs().amax(dim=1, keepdim=True) + 1e-6
-            w_per_group_scaled = w_per_group.abs() / w_per_group_max
-            w_per_group_mean = w_per_group_scaled.mean(dim=1)  # [O]
+            # Normalize weight magnitude
+            w_per_group_max = (
+                w_per_group.abs().amax(dim=1, keepdim=True) + 1e-6
+            )  # [O, 1]
+            w_per_group_scaled = w_per_group.abs() / w_per_group_max  # [O, group_size]
 
             # Log VRAM utilization
             log_gpu_usage(f"[{layer_name}] Group {g}: before scale search")
@@ -1254,8 +1303,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             # Call your per-group scale search
             best_scale_per_group = self._compute_best_scale_groupwise_per_channel(
                 x=inp,  # full input
-                w_mean=w_per_group_mean,  # per group only
-                x_mean=x_per_group_mean,  # per group only
+                w_mean_group=w_per_group_scaled,  # [O, C] or [O, group_size]
+                x_mean_group=x_mean_per_channel_per_group,  # [O, C] [O, group_size]
                 module2inspect=layer,  # full layer (layer for pass forward)
                 linears2scale=[layer],  # full layer (layer to calib scales)
                 fp16_output=fp16_output,  # full layer output
@@ -1263,6 +1312,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 group_size=self.group_size,
                 kwargs=module_kwargs,
             )
+            logger.info(f"best_scale_per_group shape == {best_scale_per_group.shape}")
 
             # Log VRAM utilization
             log_gpu_usage(f"[{layer_name}] Group {g}: after scale search")
@@ -1281,7 +1331,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             f"[{get_op_name(module, layer)}] best_scales shape: {scales.shape}"
         )
         logger.debug(
-            f"[{get_op_name(module, layer)}] best_scales preview:\n{scales[:3, :]}"
+            f"[{get_op_name(module, layer)}] best_scales preview:\n{scales[:3, :3]}"
         )
 
         assert scales.shape == (out_features, num_groups), (
@@ -1292,13 +1342,13 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         del inp, fp16_output
         clear_memory()
 
-        return get_op_name(module, prev_op), (layer_name,), scales
+        return scales
 
     def _compute_best_scale_groupwise_per_channel(
         self,
         x: torch.Tensor,
-        w_mean: torch.Tensor,
-        x_mean: torch.Tensor,
+        w_mean_group: torch.Tensor,
+        x_mean_group: torch.Tensor,
         module2inspect: torch.nn.Module,
         linears2scale: List[nn.Linear],
         fp16_output: torch.Tensor,
@@ -1329,8 +1379,8 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             x (torch.Tensor): Full input tensor to the layer (shape: [B, in_features]).
             w_mean (torch.Tensor): Per-output-channel mean of normalized weights
                 for this group (shape: [out_features]).
-            x_mean (torch.Tensor): Scalar input mean for this group, broadcasted
-                per output channel (shape: [out_features]).
+            x_mean (torch.Tensor): Per-channel input activation mean for this group,
+                broadcasted across output channels. Shape: [out_features, group_size].
             module2inspect (nn.Module): The module to forward for computing
                 the quantized output.
                 Typically a single Linear layer, but can also be a higher-level container.
@@ -1360,49 +1410,63 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
 
         device = x.device
-        x_mean = x_mean.view(-1).to(device)
-        w_mean = w_mean.view(-1).to(device)
+        x_mean_group = x_mean_group.to(
+            device
+        )  # Shape: [O, group_size] = [out_features, C]
+        w_mean_group = w_mean_group.to(device)  # Shape: [O, group_size]
 
-        assert not torch.isnan(w_mean).any(), "w_mean contains NaNs"  # extra guard
-        assert not torch.isnan(x_mean).any(), "x_mean contains NaNs"  # extra guard
+        # todo: debug; delete later
+        logger.info(
+            f"[group {group_idx}] x_group_mean shape: {x_mean_group.shape}"
+        )  # Expecting [O, C]
+        logger.info(
+            f"[group {group_idx}] w_group shape: {w_mean_group.shape}"
+        )  # Expecting [O, C] or [O, 1]
+
+        assert not torch.isnan(
+            w_mean_group
+        ).any(), "w_mean contains NaNs"  # extra guard
+        assert not torch.isnan(
+            x_mean_group
+        ).any(), "x_mean contains NaNs"  # extra guard
 
         for ratio in range(n_grid):
+
             # create new scales
             ratio = ratio / n_grid
 
             # NOTE: s^-1 * x is fused here, according to paper
-            if self.duo_scaling:
-                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
-                    min=1e-4
-                )
-            else:
-                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
-            scales_view = scales.view(-1, 1).to(
+            if self.duo_scaling:  # use both weights and activation
+                scales = (
+                    x_mean_group.pow(ratio) / (w_mean_group.pow(1 - ratio) + 1e-4)
+                ).clamp(min=1e-4)
+            else:  # activation only
+                scales = x_mean_group.pow(ratio).clamp(min=1e-4).view(-1)
+
+            scales = (scales / (scales.max() * scales.min()).sqrt()).to(
                 device
-            )  # ☑️ updated: flip dim to broadcast across num of groups input dims
+            )  # normalizaion/scale; [O, C or group_size]
 
             # avoid scaling values that overflow
             scales[torch.isinf(scales)] = 1
             scales[torch.isnan(scales)] = 1
 
-            # Q(W * s)
+            # ✅ Quantize weights: Q(W * s)
             for fc in linears2scale:
-                fc.weight[:, start:end].mul_(scales_view)  # ☑️ updated to slice weights
+                fc.weight[:, start:end].mul_(scales)  # ☑️ updated to slice weights
                 fc.weight.data[:, start:end] = (
                     self.pseudo_quantize_tensor(fc.weight.data[:, start:end])[0]
-                    / scales_view
+                    / scales
                 )  # ☑️ updated to slice weights
-                logger.debug(f"Group {group_idx}: scale shape = {scales_view.shape}")
+                logger.debug(f"Group {group_idx}: scale shape = {scales.shape}")
 
-            # W * X
+            # ✅ Feed forward to compute activation: W * X
             int_w_output = self._module_forward(x, module2inspect, kwargs)
             int_w_output = int_w_output.clip(
                 torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max
-            )  # clamp
-            int_w_output = int_w_output.to(
+            ).to(
                 "cpu"
-            )  # ☑️ Added to bring to same device as fp16_output
+            )  # ☑️ clamp; Added to bring to same device as fp16_output
 
             # compute mean squared error (L2 norm)
             loss = self._compute_loss(fp16_output, int_w_output, device)
@@ -1520,76 +1584,133 @@ class ScroogeAwqQuantizer(AwqQuantizer):
     @torch.no_grad()
     def compute_zeros(
         self,
-        weight: torch.Tensor,  # shape: [O, I]
-        scales: torch.Tensor,  # shape: [G]
+        weight: torch.Tensor,  # [O, I]
+        scales: torch.Tensor,  # [O, num_groups]
         group_size: int,
     ) -> torch.Tensor:
         """
-        Compute symmetric zero-points for group-wise quantization, matching
-        the same granularity and broadcasting behavior as scale search.
+        Compute asymmetric per-input-group, per-output-channel zero-points for GEMM
+        quantization.
 
-        This function computes a single zero-point per input group (e.g., per
-        128-column slice of the weight matrix), based on the average value of
-        that group’s weights across all output channels. This aligns with the
-        per-group scalar output of `search_best_scale`, and is compatible with
-        broadcasting logic used in _search_best_scale function.
-
-        Args:
-            weight (Tensor): Full weight matrix of shape [out_features, in_features].
-                             This is the Linear layer’s unquantized weights.
-            scales (Tensor): Tensor of shape [num_groups], one scale per input group.
-                             Must match the same grouping used during scale search.
-            group_size (int): Number of input channels per group (e.g., 128).
-                              Must evenly divide in_features.
-
-        Returns:
-            Tensor: Zero-point tensor of shape [num_groups], where each value is
-                    a scalar offset for symmetric quantization of the corresponding
-                    group. This output matches the shape of `scales` and is intended
-                    to be expanded later to [G, O] for use in quantized GEMM kernels.
+        This method is compatible with AutoAWQ's GEMM kernels, where zero points are
+        needed for each output channel and each quant group.
 
         Formula:
-            For each group g:
-                - Extract weights W[:, g_start:g_end] → shape [O, group_size]
-                - Compute mean of the group: mean_g = W[:, g_start:g_end].mean()
-                - Compute zero-point: zero_g = floor(-mean_g / scale_g + 0.5)
+            zero[o, g] = round(-min(W[o, g_start:g_end]) / scale[o, g])
 
-        Notes:
-            - The output shape is [G], not [O, G].
-            - It is broadcast later via `.expand(O, G).T` to [G, O], just like scales.
-            - This mode aligns with AWQ’s "per-group shared" quantization logic.
+        Args:
+            weight (torch.Tensor): Linear layer weight [O, I]
+            scales (torch.Tensor): Per-channel per-group scales [O, G]
+            group_size (int): Group size used during quantization
 
+        Returns:
+            torch.Tensor: Zero points as int32 [G, O] — transposed to match GEMM layout
         """
-
         O, I = weight.shape
         if I % group_size != 0:
-            raise ValueError("in_features must be divisible by group_size")
+            raise ValueError(
+                f"Input dim {I} is not divisible by group_size {group_size}"
+            )
 
         G = I // group_size
-        zeros = torch.empty(G, device=weight.device, dtype=scales.dtype)
+        if scales.shape != (O, G):
+            raise ValueError(
+                f"Expected scales of shape [O, G] = [{O}, {G}], but got {scales.shape}"
+            )
+
+        # Output shape: [G, O] for GEMM kernel
+        zeros = torch.empty(G, O, dtype=torch.int32, device=weight.device)
 
         for g in range(G):
-            start, end = g * group_size, (g + 1) * group_size
-
-            # Slice group: [O, group_size]
-            w_group = weight[:, start:end]
-
-            # Match scale logic: compute mean across dim=1 (per row)
-            mean_per_row = w_group.mean(dim=1)  # [O]
-            mean_g = mean_per_row.mean()  # ⬅️ average over all rows
-
-            scale_g = scales[g]
-
-            # Symmetric zero-point
-            zeros[g] = torch.floor(-mean_g / scale_g + 0.5)
+            start = g * group_size
+            end = (g + 1) * group_size
+            w_group = weight[:, start:end]  # [O, group_size]
+            min_vals = w_group.min(dim=1).values  # [O]
+            scale_g = scales[:, g].to(torch.float32)  # [O]
+            zero_vals = (-min_vals / scale_g).round().to(torch.int32)  # [O]
+            zeros[g] = zero_vals
 
             if g == 0:
                 logger.debug(
-                    f"[compute_zeros] Group {g}: mean_g={mean_g.item():.4f}, "
-                    f"scale_g={scale_g.item():.4f}, zero={zeros[g].item():.2f}"
+                    f"[compute_zeros] Group {g}: "
+                    f"scale_g[:5]={scale_g[:5].tolist()}, "
+                    f"min_vals[:5]={min_vals[:5].tolist()}, "
+                    f"zero_vals[:5]={zero_vals[:5].tolist()}"
                 )
 
-        logger.info(f"✅ Computed per-group zero-points: shape={zeros.shape}")
+        logger.info(
+            f"✅ Computed int32 zero-points: shape={zeros.shape}, dtype={zeros.dtype}"
+        )
+        logger.debug(f"[compute_zeros] First group zeros: {zeros[0, :5].tolist()}")
+        logger.debug(f"[compute_zeros] min={zeros.amin()}, max={zeros.amax()}")
+
+        return zeros  # [G, O]
+
+    @torch.no_grad()
+    def compute_zeros_per_channel(
+        self,
+        weight: torch.Tensor,  # shape: [O, I] — output × input
+        scales: torch.Tensor,  # shape: [O, G] — one scale per output and group
+        group_size: int,
+    ) -> torch.Tensor:
+        """
+        * Compute per-output-channel, per-group asymmetric zero-points for quantization.
+        ! Asymmetric requires per group, per channel computation!
+
+        This function calculates a separate zero-point for each output channel (row) and
+        input group (column slice) using the asymmetric formula:
+            zero = round(-min(w) / scale)
+
+        This aligns with the quantization format used by AWQ-style inference kernels, which
+        apply weight group-wise but retain per-channel scaling.
+
+        Args:
+            weight (torch.Tensor): Unquantized weight matrix of shape [O, I],
+                                where O = output channels and I = input features.
+            scales (torch.Tensor): Scaling tensor of shape [O, G] (float16 or float32),
+                                where G = I // group_size.
+            group_size (int): Number of input features per group. Must divide I evenly.
+
+        Returns:
+            torch.Tensor: Zero-point tensor of shape [G, O], dtype=torch.int32.
+                        Each [g, o] entry contains the zero point for group g, output o.
+
+        Notes:
+            - The output is transposed to [G, O] to match kernel expectations (e.g., GEMM).
+            - Assumes asymmetric quantization where zeros are non-zero integers.
+            - Improves range fit over symmetric quantization (which assumes zero-point = 0).
+        """
+        O, I = weight.shape
+        if I % group_size != 0:
+            raise ValueError(
+                f"Input dim I={I} must be divisible by group_size={group_size}"
+            )
+
+        G = I // group_size
+        zeros = torch.empty(G, O, dtype=torch.int32, device=weight.device)  # [G, O]
+
+        for g in range(G):
+            start, end = g * group_size, (g + 1) * group_size
+            w_group = weight[:, start:end]  # shape: [O, group_size]
+            min_vals = w_group.min(dim=1).values  # shape: [O]
+            scale_g = scales[:, g].to(torch.float32)  # shape: [O]
+            zero_vals = (-min_vals / scale_g).round().to(torch.int32)  # shape: [O]
+            zeros[g] = zero_vals
+
+            if g == 0:
+                logger.debug(
+                    f"[compute_zeros] Group {g}: "
+                    f"scale_g[:5]={scale_g[:5].tolist()}, "
+                    f"min_vals[:5]={min_vals[:5].tolist()}, "
+                    f"zero_vals[:5]={zero_vals[:5].tolist()}"
+                )
+
+        logger.info(
+            f"✅ Computed int32 zero-points: shape={zeros.shape}, dtype={zeros.dtype}"
+        )
+        logger.debug(f"[compute_zeros] First group zeros: {zeros[0, :5].tolist()}")
+        logger.debug(f"[compute_zeros] min={zeros.amin()}, max={zeros.amax()}")
+
         return zeros
 
     def calibrate_and_quantize(
@@ -1617,9 +1738,10 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             save_dir_path (Optional[str | Path]):
                 If provided, saves quantized model weights and metadata to this path.
             use_full_calib (bool):
-                If True, performs full calibration with per-output-channel per-group scale search
-                (resulting in a [O, G] scale tensor). This improves quantization accuracy but
-                requires more computation. If False, uses a lighter calibration mode with
+                If True, performs full calibration with per-output-channel per-group
+                scale search (resulting in a [O, G] scale tensor). This improves quantization
+                accuracy but requires more computation.
+                If False, uses a lighter calibration mode with
                 one scale per group ([G]), which is faster but less precise.
 
         Raises:
@@ -1633,10 +1755,14 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         """
         start_time = time.time()
 
+        # Setup search scale and compute zeros functions based on use_full_calib
         search_best_scale_fn = (
             self._search_best_scale_per_channel
             if use_full_calib
             else self._search_best_scale
+        )
+        compute_zeros_fn = (
+            self.compute_zeros_per_channel if use_full_calib else self.compute_zeros
         )
         mode_str = (
             "full (per-channel per-group)"
@@ -1748,7 +1874,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     layer_name = name_to_layer.get(layer)
                     if layer_name is None:
                         raise ValueError(f"Layer not found in name mapping: {layer}")
-                    logger.info(f"🔎 [scale] {layer_name}")
+                    logger.info(f"🔎 [scale] for {layer_name}")
 
                     log_gpu_usage(
                         f"[calibrate] Block {idx} - before scale search ({layer_name})"
@@ -1759,7 +1885,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         prev_op=prev_op,
                         layer=layer,
                         inp=input_feat[layer_name],
-                    )
+                    )  # [O, G]
 
                     best_scales = best_scales.to(device)
                     scales_dict[layer_name] = best_scales
@@ -1812,10 +1938,22 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     layer_name = name_to_layer[layer]
 
                     # Apply scales
-                    scales = scales_dict[layer_name]
+                    scales = scales_dict[layer_name]  # [O, G] or [G]
                     logger.info(f"🧪 [apply] scale to {layer_name}")
                     apply_scale_all_groups(layer=layer, scales=scales)
                     logger.info(f"Scales applied to {layer_name}")
+
+                    # todo: extra logging to investigate 0 z-points; delete later
+                    weight = layer.weight.data
+                    group_size = self.group_size  # <-- use self here
+                    G = weight.shape[1] // group_size
+                    mean_per_group = [
+                        weight[:, g * group_size : (g + 1) * group_size].mean().item()
+                        for g in range(G)
+                    ]
+                    logger.info(
+                        f"[{layer_name}] Mean per group after scale: {mean_per_group[:5]}"
+                    )
 
                     # move scales to CPU to free up VRAM
                     scales = offload_tensor_to_cpu(scales)
@@ -1837,9 +1975,10 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                             logger.debug(f"[clip] {clip_name} skipped")
 
                     # Compute zeros
-                    zeros = self.compute_zeros(layer.weight, scales, self.group_size)
+                    zeros = compute_zeros_fn(layer.weight, scales, self.group_size)
+
                     logger.debug(
-                        f"[zeros] {layer_name} → {zeros.shape}, first 5: {zeros[:5].tolist()}"
+                        f"[zeros] {layer_name} → {zeros.shape}, first group first 5: {zeros[0, :5].tolist()}"
                     )
 
                     zeros = offload_tensor_to_cpu(
@@ -1865,33 +2004,12 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                     zeros = zeros.to(device)
                     layer = layer.to(device)
 
-                    # Get dimensions
-                    O = layer.weight.shape[0]  # out_features
-                    I = layer.weight.shape[1]  # in_features
-                    G = I // self.group_size
-
-                    # 🧩 Expand 1D [G] → 2D [O, G] if needed
+                    # Broadcaser & Transpose scales to -> [G, O] (input feature, output feature shape)
+                    # ! need to transpose from o, g shape to g, o shape for GEMM function
                     if scales.dim() == 1:
-                        scales = (
-                            scales.view(1, G).expand(O, G).contiguous()
-                        )  # [O, G] → then transpose → [G, O]
-
-                    if zeros.dim() == 1:
-                        zeros = (
-                            zeros.view(1, G).expand(O, G).contiguous()
-                        )  # [O, G] → then transpose → [G, O]
-
-                    # ! Transpose to -> [G, O] (input feature, output feature shape)
-                    scales_t = scales.t().contiguous()  # shape: [G, O]
-                    zeros_t = zeros.t().contiguous()  # shape: [G, I]
-
-                    # # todo: try this now
-                    # I = layer.weight.shape[1]  # in_features
-                    # G = I // self.group_size
-
-                    # # Expand before .from_linear
-                    # scales_t = scales.view(G, 1).expand(G, I).contiguous()
-                    # zeros_t = zeros.view(G, 1).expand(G, I).contiguous()
+                        G = scales.shape[0]
+                        O = layer.weight.shape[0]
+                        scales_t = scales.view(G, 1).expand(G, O).contiguous()
 
                     # todo: debug; delete later
                     # 🔍 Quantization debug peek
@@ -1903,7 +2021,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         f"[{layer_name}] scales: shape={scales_t.shape}, max={scales_t.max():.6f}, min={scales_t.min():.6f}, mean={scales_t.mean():.6f}"
                     )
                     logger.debug(
-                        f"[{layer_name}] zeros: shape={zeros_t.shape}, max={zeros_t.max():.2f}, min={zeros_t.min():.2f}, mean={zeros_t.float().mean():.2f}"
+                        f"[{layer_name}] zeros: shape={zeros.shape}, max={zeros.max():.2f}, min={zeros.min():.2f}, mean={zeros.float().mean():.2f}"
                     )
 
                     # Optional: print actual small slice
@@ -1921,16 +2039,12 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         )
 
                     # Zero-points
-                    if (
-                        zeros_t.ndim == 2
-                        and zeros_t.size(0) >= 5
-                        and zeros_t.size(1) >= 5
-                    ):
+                    if zeros.ndim == 2 and zeros.size(0) >= 5 and zeros.size(1) >= 5:
                         logger.debug(
-                            f"[{layer_name}] zero[:5, :5] = {zeros_t[:5, :5].tolist()}"
+                            f"[{layer_name}] zero[:5, :5] = {zeros[:5, :5].tolist()}"
                         )
                     else:
-                        logger.debug(f"[{layer_name}] zero preview: {zeros_t.tolist()}")
+                        logger.debug(f"[{layer_name}] zero preview: {zeros.tolist()}")
 
                     # Weights
                     if (
@@ -1951,7 +2065,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         w_bit=self.w_bit,
                         group_size=self.group_size,
                         scales=scales_t,
-                        zeros=zeros_t,
+                        zeros=zeros,
                     )
 
                     # todo: debug; delete later
@@ -2042,7 +2156,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                         del input_feat[layer_name]
 
                     # ✅ FREE TRANSIENT TENSORS FROM VRAM (scales, zeros, etc.)
-                    del scales, zeros, scales_t, zeros_t
+                    del scales, zeros, scales_t
                     gc.collect()
                     torch.cuda.empty_cache()
 
@@ -2071,18 +2185,6 @@ class ScroogeAwqQuantizer(AwqQuantizer):
                 input_feat=input_feat,
                 device="cpu",
             )
-
-            # # todo: commented out for now; delete the code later
-            # # Move current module back to CPU and update list
-            # module = module.cpu()
-            # self.modules[idx] = module
-
-            # # Move shared embeddings off GPU
-            # self.move_embed(self.model, "cpu")
-
-            # # Trigger cleanup
-            # torch.cuda.empty_cache()
-            # gc.collect()
 
             log_gpu_usage(
                 f"[calibrate] Block {idx} - end of block after memory cleanup"
@@ -2239,13 +2341,32 @@ class ScroogeAwqQuantizer(AwqQuantizer):
             config = {}
 
         # Inject quantization_config field using HuggingFace-style names
-        config["quantization_config"] = {
-            "bits": self.quant_config.get("w_bit", 4),
-            "group_size": self.quant_config.get("q_group_size", 128),
-            "zero_point": self.quant_config.get("zero_point", True),
-            "version": self.quant_config.get("version", "GEMM").lower(),
-            "quant_method": self.quant_config.get("quant_method", "awq"),
+
+        # HuggingFace-compatible key mapping
+        key_map = {
+            "w_bit": "bits",
+            "q_group_size": "group_size",
+            "zero_point": "zero_point",
+            "version": "version",
+            "quant_method": "quant_method",
         }
+
+        # Dynamically map and lowercase version
+        quant_config_hf = {
+            hf_key: (
+                self.quant_config.get(orig_key)
+                if orig_key != "version"
+                else self.quant_config.get("version", "GEMM").lower()
+            )
+            for orig_key, hf_key in key_map.items()
+        }
+
+        # Include excluded layers if present
+        if hasattr(self, "modules_to_not_convert"):
+            quant_config_hf["modules_to_not_convert"] = self.modules_to_not_convert
+
+        # Inject into config.json
+        config["quantization_config"] = quant_config_hf
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)

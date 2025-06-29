@@ -45,41 +45,67 @@ def normalize_scales_across_groups(
     epsilon: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """
-    Normalize 1D scalar group-wise scales across layers that share input.
-    Assumes each layer's scale is a 1D tensor of shape [G].
+    Normalize group-wise or per-channel-per-group scales across layers that share input.
+
+    Supports:
+        - Per-group: shape [G]
+        - Per-channel-per-group: shape [O, G]
+
+    For each group g, this ensures the scale across layers is normalized relative to
+    the shared maximum value — either globally (per-group) or per output channel.
 
     Args:
-        layers: List of nn.Linear layers or (layer, slice) for fused QKV.
-        name_to_layer: Mapping from layer or (layer, slice) to layer name.
-        scales_dict: Dict from layer name to 1D scale tensor.
-        epsilon: Stability constant.
+        layers: List of nn.Linear layers or (layer, slice) pairs.
+        name_to_layer: Mapping from each entry in `layers` to a unique string name.
+        scales_dict: Dict mapping layer names to scale tensors.
+        epsilon: Small value added to denominator for stability.
 
     Returns:
-        Updated scales_dict with group-wise normalized scales.
+        Updated scales_dict with normalized values (same shape as input).
     """
-    per_group_max = {}
+    layer_names = [name_to_layer[l] for l in layers]
+    sample_scale = scales_dict[layer_names[0]]
+    scale_dim = sample_scale.dim()
 
-    for entry in layers:
-        name = name_to_layer[entry]
-        scale = scales_dict[name]
-        assert scale.dim() == 1, f"{name} must be 1D [G], got {scale.shape}"
-        per_group_max[name] = scale.abs().tolist()
+    # Validate all layers have same shape
+    for name in layer_names:
+        assert (
+            scales_dict[name].shape == sample_scale.shape
+        ), f"{name} scale shape mismatch: expected {sample_scale.shape}, got {scales_dict[name].shape}"
 
-    G = len(next(iter(per_group_max.values())))
-    shared_max = [
-        max(per_group_max[name][g] for name in per_group_max) for g in range(G)
-    ]
+    if scale_dim == 1:
+        # --- Per-group [G] ---
+        stacked = torch.stack(
+            [scales_dict[name] for name in layer_names], dim=0
+        )  # [L, G]
+        shared_max = stacked.abs().amax(dim=0, keepdim=False)  # [G]
+        for i, name in enumerate(layer_names):
+            normed = stacked[i] / (shared_max + epsilon)  # [G]
+            if torch.isnan(normed).any():
+                logger.warning(f"[NaN Detected] in scale norm for layer {name}")
+            scales_dict[name] = normed.clamp(min=1e-4)
 
-    # Normalize each scale
-    for entry in layers:
-        name = name_to_layer[entry]
-        scale = scales_dict[name]
-        current_max = per_group_max[name]
-        normed = torch.empty_like(scale)
-        for g in range(G):
-            ratio = current_max[g] / (shared_max[g] + epsilon)
-            normed[g] = scale[g] * ratio
-        scales_dict[name] = normed
+    elif scale_dim == 2:
+        # --- Per-channel-per-group [O, G] ---
+        stacked = torch.stack(
+            [scales_dict[name] for name in layer_names], dim=0
+        )  # [L, O, G]
+        shared_max = stacked.abs().amax(dim=0, keepdim=False)  # [O, G]
+        for i, name in enumerate(layer_names):
+            normed = stacked[i] / (shared_max + epsilon)  # [O, G]
+            if torch.isnan(normed).any():
+                logger.warning(f"[NaN Detected] in scale norm for layer {name}")
+            scales_dict[name] = normed.clamp(min=1e-4, max=10.0)
+
+    else:
+        raise ValueError(
+            f"Unsupported scale shape: {sample_scale.shape}. Must be 1D or 2D."
+        )
+
+    logger.debug(f"[normalize_scales] mode: {scale_dim}D, shape: {sample_scale.shape}")
+    logger.debug(
+        f"[normalize_scales] first layer preview: {scales_dict[layer_names[0]][:5]}"
+    )
 
     return scales_dict
 
@@ -132,18 +158,23 @@ def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
             - weight[:, g_start:g_end] *= scales[g]
     """
     weight = layer.weight.data
-    O, I = weight.shape
+    out_features, in_features = weight.shape
+    num_groups, group_size = scales.shape
+
+    assert (
+        in_features == num_groups * group_size
+    ), f"Mismatch: {in_features=} != {num_groups}×{group_size}"
 
     if scales.dim() != 1:
         raise ValueError(f"Expected 1D tensor of scales, got shape {scales.shape}")
 
     num_groups = scales.shape[0]
-    if I % num_groups != 0:
+    if in_features % num_groups != 0:
         raise ValueError(
-            f"Incompatible group size: in_features={I}, num_groups={num_groups}"
+            f"Incompatible group size: in_features={in_features}, num_groups={num_groups}"
         )
 
-    group_size = I // num_groups
+    group_size = in_features // num_groups
     scales = scales.to(weight.device)
 
     for g in range(num_groups):

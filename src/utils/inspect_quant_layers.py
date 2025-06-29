@@ -115,8 +115,9 @@ def inspect_quant_layer_files(
     save_path: Optional[Path | str] = None,
 ) -> None:
     """
-    Inspect all `.pt` quantized layer files in a directory for qweight, qzeros, scales,
+    - Inspect all `.pt` quantized layer files in a directory for qweight, qzeros, scales,
     and bias sanity.
+    - Save the inspection results to disk
 
     Args:
         layer_dir (Path): Directory containing quantized layer `.pt` files.
