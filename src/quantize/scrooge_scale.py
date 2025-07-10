@@ -150,8 +150,8 @@ def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
 
     Args:
         layer (nn.Linear): Target Linear layer.
-        scales (torch.Tensor): 1D tensor of shape [num_groups], where each value
-            scales a corresponding group of input weights (columns).
+        scales: Tensor of shape [num_groups, out_features], where each row g contains
+            scale values for all output neurons for input group g.
 
     Behavior:
         For each group g:
@@ -159,16 +159,15 @@ def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
     """
     weight = layer.weight.data
     out_features, in_features = weight.shape
-    num_groups, group_size = scales.shape
+    num_groups, out_features_check = scales.shape
 
     assert (
-        in_features == num_groups * group_size
-    ), f"Mismatch: {in_features=} != {num_groups}×{group_size}"
+        out_features == out_features_check
+    ), f"Mismatch: weight has {out_features} outputs, scales has {out_features_check}"
 
-    if scales.dim() != 1:
-        raise ValueError(f"Expected 1D tensor of scales, got shape {scales.shape}")
+    if scales.dim() != 2:
+        raise ValueError(f"Expected 2D tensor of scales, got shape {scales.shape}")
 
-    num_groups = scales.shape[0]
     if in_features % num_groups != 0:
         raise ValueError(
             f"Incompatible group size: in_features={in_features}, num_groups={num_groups}"
@@ -180,10 +179,10 @@ def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
     for g in range(num_groups):
         start = g * group_size
         end = (g + 1) * group_size
-        weight[:, start:end].mul_(scales[g])
+        weight[:, start:end].mul_(scales[g].view(-1, 1))  # ✅ broadcasting to reshape
 
     logger.info(
-        f"[apply_scale_all_groups] Applied scalar scaling: {num_groups} groups × {O} outputs"
+        f"[apply_scale_all_groups] Applied scalar scaling: {num_groups} groups × {out_features} outputs"
     )
 
 

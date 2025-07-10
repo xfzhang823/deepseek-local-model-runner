@@ -209,6 +209,25 @@ def forward_with_memory_chunking(
     return torch.cat(outputs, dim=0).to(inp.dtype).view(inp.shape[0], inp.shape[1], -1)
 
 
+def get_scale_for_zero_point(
+    weight: torch.Tensor, group_size: int, w_bit: int
+) -> torch.Tensor:
+    O, I = weight.shape
+    G = I // group_size
+    qmax = 2**w_bit - 1
+    scales = torch.empty((G, O), dtype=torch.float32, device=weight.device)
+
+    for g in range(G):
+        start = g * group_size
+        end = (g + 1) * group_size
+        w_group = weight[:, start:end]
+        w_min = w_group.min(dim=1).values
+        w_max = w_group.max(dim=1).values
+        scales[g] = (w_max - w_min).clamp(min=1e-5) / qmax
+
+    return scales  # [G, O]
+
+
 def get_safe_parallel_sample_count() -> int:
     """
     Get the SAFE no. of parallel sample, given the device's vram.

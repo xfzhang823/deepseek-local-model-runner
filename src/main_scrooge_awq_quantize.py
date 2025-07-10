@@ -30,6 +30,9 @@ def main():
     # Define your input model path and save path
     model_path = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR)
     save_path = str(DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR)
+    save_layers_dir = str(
+        DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR / "quantized_layers_duo_scaling"
+    )  # if using duo_sclaing
 
     # Run quantization pipeline
     run_scrooge_quant_pipeline(
