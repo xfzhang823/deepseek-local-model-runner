@@ -235,7 +235,7 @@ def get_safe_parallel_sample_count() -> int:
     """
     total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     if total_mem < 6:
-        return 4
+        return 3
     elif total_mem < 10:
         return 8
     else:

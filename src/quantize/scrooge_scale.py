@@ -10,9 +10,7 @@ from typing import List, Tuple, Optional, Dict, cast, Union
 import torch
 import torch.nn as nn
 from awq.utils.utils import get_best_device
-from awq.modules.act import ScaledActivation
-from awq.utils.module import get_op_by_name, get_op_name
-from awq.quantize.scale import scale_gelu_fc
+from awq.utils.module import get_op_by_name
 from transformers.models.bloom.modeling_bloom import BloomGelu
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
@@ -146,112 +144,28 @@ def scale_ln_fc(fc_layer: nn.Linear, scales: torch.Tensor) -> None:
 @torch.no_grad()
 def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
     """
-    Applies scalar group-wise scaling to a Linear layer's weights in-place.
+    Applies per-input-channel group-wise scaling to a Linear layer's weights in-place.
 
     Args:
         layer (nn.Linear): Target Linear layer.
-        scales: Tensor of shape [num_groups, out_features], where each row g contains
-            scale values for all output neurons for input group g.
-
-    Behavior:
-        For each group g:
-            - weight[:, g_start:g_end] *= scales[g]
+        scales (Tensor): [num_groups, group_size], scale for each input channel in group.
     """
-    weight = layer.weight.data
+    weight = layer.weight.data  # [out_features, in_features]
     out_features, in_features = weight.shape
-    num_groups, out_features_check = scales.shape
+    num_groups, group_size = scales.shape
+    assert in_features == num_groups * group_size
 
-    assert (
-        out_features == out_features_check
-    ), f"Mismatch: weight has {out_features} outputs, scales has {out_features_check}"
-
-    if scales.dim() != 2:
-        raise ValueError(f"Expected 2D tensor of scales, got shape {scales.shape}")
-
-    if in_features % num_groups != 0:
-        raise ValueError(
-            f"Incompatible group size: in_features={in_features}, num_groups={num_groups}"
-        )
-
-    group_size = in_features // num_groups
     scales = scales.to(weight.device)
 
     for g in range(num_groups):
         start = g * group_size
         end = (g + 1) * group_size
-        weight[:, start:end].mul_(scales[g].view(-1, 1))  # ✅ broadcasting to reshape
+        # scales[g]: [group_size], want to apply to all output channels, so broadcast to [1, group_size]
+        weight[:, start:end].mul_(scales[g].view(1, -1))
 
     logger.info(
-        f"[apply_scale_all_groups] Applied scalar scaling: {num_groups} groups × {out_features} outputs"
+        f"[apply_scale_all_groups] Applied per-input-channel scaling: {num_groups} groups × {group_size} inputs each"
     )
-
-
-# todo: commented out; applying scalar to each group; delete later
-# @torch.no_grad()
-# def apply_scale_all_groups(layer: nn.Linear, scales: torch.Tensor) -> None:
-#     """
-#     Applies group-wise scaling to a Linear layer's weights in-place.
-
-#     This function assumes that the input dimension of the layer is divided into
-#     equal-sized groups (e.g., group_size = in_features // num_groups), and that
-#     each group has a corresponding scale per output channel.
-
-#     Args:
-#         layer (nn.Linear): The Linear layer whose weights will be modified.
-#         scales (torch.Tensor): A 2D tensor of shape [out_features, num_groups],
-#             where each entry scales a corresponding group of input weights.
-
-#     Behavior:
-#         For each group g:
-#             - Scales the weight slice [:, g_start:g_end] by scales[:, g]
-#             - Modifies layer.weight.data in-place
-
-#     Raises:
-#         AssertionError: If scale dimensions do not align with the layer's weight shape.
-#     """
-#     try:
-#         weight = layer.weight.data
-#         O, I = weight.shape
-
-#         scales = scales.to(weight.device)  # ensures scales are on GPU
-
-#         if scales.dim() != 2:
-#             raise ValueError(
-#                 f"Expected scales to be 2D [out_features, num_groups], got {scales.shape}"
-#             )
-
-#         S_O, G = scales.shape
-#         if O != S_O:
-#             raise ValueError(
-#                 f"Mismatch: weight.out_features={O}, but scales.shape[0]={S_O}"
-#             )
-
-#         if I % G != 0:
-#             raise ValueError(
-#                 f"Incompatible group size: in_features={I}, num_groups={G} → not divisible"
-#             )
-
-#         group_size = I // G
-#         logger.debug(
-#             f"[scale_weights_by_group] layer={layer.__class__.__name__}, "
-#             f"weight.shape={weight.shape}, scale.shape={scales.shape}, "
-#             f"group_size={group_size}, num_groups={G}"
-#         )
-
-#         for g in range(G):
-#             start = g * group_size
-#             end = (g + 1) * group_size
-#             s = scales[:, g].view(-1, 1)  # [O, 1]
-#             weight[:, start:end].mul_(s)
-
-#         logger.info(
-#             f"[scale_weights_by_group] Successfully applied group-wise scale: "
-#             f"{G} groups × {O} output neurons"
-#         )
-
-#     except Exception as e:
-#         logger.error(f"[scale_weights_by_group] Failed to apply scaling: {e}")
-#         raise
 
 
 @torch.no_grad()

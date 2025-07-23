@@ -16,74 +16,6 @@ from transformers import PreTrainedModel
 logger = logging.getLogger(__name__)
 
 
-def summarize_quantization_structure(model: PreTrainedModel) -> pd.DataFrame:
-    """
-    Inspect and summarize quantization structure of a model:
-    - Identifies WQLinear_GEMM (quantized) vs nn.Linear (unquantized)
-    - Shows which tensors were loaded from state_dict (vs. missing or meta)
-
-    Args:
-        model (PreTrainedModel): A loaded model (e.g., from AutoAWQForCausalLM)
-
-    Returns:
-        pd.DataFrame: Summary with Layer, Module Type, Weight, Bias, Meta Tensor status
-
-    Example:
-        >>> from transformers import AutoAWQForCausalLM
-        >>> model = AutoAWQForCausalLM.from_quantized("path/to/quant_model")
-        >>> from quant_model_audit_utils import summarize_quantization_structure
-        >>> df = summarize_quantization_structure(model)
-        >>> print(df.head())
-    """
-
-    try:
-        state_keys = set(model.state_dict().keys())
-    except Exception as e:
-        logger.error("Failed to retrieve model state_dict: %s", e)
-        raise
-
-    summary: List[dict] = []
-
-    for name, module in model.named_modules():
-        if isinstance(module, (WQLinear_GEMM, nn.Linear)):
-            layer_type = (
-                "WQLinear_GEMM" if isinstance(module, WQLinear_GEMM) else "nn.Linear"
-            )
-            w_key = f"{name}.weight"
-            b_key = f"{name}.bias"
-
-            weight_status = "loaded" if w_key in state_keys else "missing"
-            bias_status = "loaded" if b_key in state_keys else "missing or not used"
-
-            # Try checking meta status safely
-            try:
-                if hasattr(module, "weight"):
-                    is_meta = getattr(module.weight, "is_meta", False)
-                else:
-                    is_meta = "n/a"
-            except Exception as meta_error:
-                logger.warning(
-                    "Unable to determine 'meta' status for layer %s: %s",
-                    name,
-                    meta_error,
-                )
-                is_meta = "unknown"
-
-            summary.append(
-                {
-                    "Layer": name,
-                    "Module Type": layer_type,
-                    "Weight": weight_status,
-                    "Bias": bias_status,
-                    "Meta Tensor": is_meta,
-                }
-            )
-
-    df = pd.DataFrame(summary).sort_values("Layer").reset_index(drop=True)
-    logger.info("Quantization structure summary completed with %d entries.", len(df))
-    return df
-
-
 def audit_model_quantization(model: PreTrainedModel) -> pd.DataFrame:
     """
     Extended audit of model quantization state:
@@ -160,4 +92,148 @@ def audit_model_quantization(model: PreTrainedModel) -> pd.DataFrame:
     df["Quant State Expected"] = df["Module Type"] == "WQLinear_GEMM"
 
     logger.info("Quantization audit completed with %d layers checked.", len(df))
+    return df
+
+
+def audit_quantized_layers_in_memory(model):
+    """
+    Audits all quantized layers (WQLinear_GEMM) in the loaded model.
+    Checks for presence and shape of qweight, qzeros, and scales tensors in memory.
+    Logs a warning for any missing or zero-sized tensors.
+
+    Example usage after model load:
+    >>> audit_quantized_layers_in_memory(model)
+    """
+    missing_layers = []
+    total_layers = 0
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, WQLinear_GEMM):
+            total_layers += 1
+            qweight = getattr(mod, "qweight", None)
+            qzeros = getattr(mod, "qzeros", None)
+            scales = getattr(mod, "scales", None)
+            has_all = True
+            # Check presence and nonzero shape
+            if (
+                qweight is None
+                or not isinstance(qweight, torch.Tensor)
+                or qweight.numel() == 0
+            ):
+                logger.warning(f"[AUDIT] {name}: qweight MISSING or empty")
+                has_all = False
+            if (
+                qzeros is None
+                or not isinstance(qzeros, torch.Tensor)
+                or qzeros.numel() == 0
+            ):
+                logger.warning(f"[AUDIT] {name}: qzeros MISSING or empty")
+                has_all = False
+            if (
+                scales is None
+                or not isinstance(scales, torch.Tensor)
+                or scales.numel() == 0
+            ):
+                logger.warning(f"[AUDIT] {name}: scales MISSING or empty")
+                has_all = False
+            if has_all:
+                qweight_shape = (
+                    qweight.shape
+                    if (qweight is not None and isinstance(qweight, torch.Tensor))
+                    else None
+                )
+                qzeros_shape = (
+                    qzeros.shape
+                    if (qzeros is not None and isinstance(qzeros, torch.Tensor))
+                    else None
+                )
+                scales_shape = (
+                    scales.shape
+                    if (scales is not None and isinstance(scales, torch.Tensor))
+                    else None
+                )
+                logger.info(
+                    f"[AUDIT] {name}: OK (qweight {qweight_shape}, qzeros {qzeros_shape}, scales {scales_shape})"
+                )
+
+            else:
+                missing_layers.append(name)
+
+    if missing_layers:
+        logger.warning(
+            f"⚠️ {len(missing_layers)} quantized layers with missing/invalid tensors:"
+        )
+        for lname in missing_layers:
+            logger.warning(f"    - {lname}")
+    else:
+        logger.info("✅ All quantized layers loaded with valid tensors.")
+
+    logger.info(f"Checked {total_layers} quantized layers.")
+
+
+def summarize_quantization_structure(model: PreTrainedModel) -> pd.DataFrame:
+    """
+    Inspect and summarize quantization structure of a model:
+    - Identifies WQLinear_GEMM (quantized) vs nn.Linear (unquantized)
+    - Shows which tensors were loaded from state_dict (vs. missing or meta)
+
+    Args:
+        model (PreTrainedModel): A loaded model (e.g., from AutoAWQForCausalLM)
+
+    Returns:
+        pd.DataFrame: Summary with Layer, Module Type, Weight, Bias, Meta Tensor status
+
+    Example:
+        >>> from transformers import AutoAWQForCausalLM
+        >>> model = AutoAWQForCausalLM.from_quantized("path/to/quant_model")
+        >>> from quant_model_audit_utils import summarize_quantization_structure
+        >>> df = summarize_quantization_structure(model)
+        >>> print(df.head())
+    """
+
+    try:
+        state_keys = set(model.state_dict().keys())
+    except Exception as e:
+        logger.error("Failed to retrieve model state_dict: %s", e)
+        raise
+
+    summary: List[dict] = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, (WQLinear_GEMM, nn.Linear)):
+            layer_type = (
+                "WQLinear_GEMM" if isinstance(module, WQLinear_GEMM) else "nn.Linear"
+            )
+            w_key = f"{name}.weight"
+            b_key = f"{name}.bias"
+
+            weight_status = "loaded" if w_key in state_keys else "missing"
+            bias_status = "loaded" if b_key in state_keys else "missing or not used"
+
+            # Try checking meta status safely
+            try:
+                if hasattr(module, "weight"):
+                    is_meta = getattr(module.weight, "is_meta", False)
+                else:
+                    is_meta = "n/a"
+            except Exception as meta_error:
+                logger.warning(
+                    "Unable to determine 'meta' status for layer %s: %s",
+                    name,
+                    meta_error,
+                )
+                is_meta = "unknown"
+
+            summary.append(
+                {
+                    "Layer": name,
+                    "Module Type": layer_type,
+                    "Weight": weight_status,
+                    "Bias": bias_status,
+                    "Meta Tensor": is_meta,
+                }
+            )
+
+    df = pd.DataFrame(summary).sort_values("Layer").reset_index(drop=True)
+    logger.info("Quantization structure summary completed with %d entries.", len(df))
     return df

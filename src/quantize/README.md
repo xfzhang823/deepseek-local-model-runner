@@ -72,3 +72,20 @@ X ∈ [B, 1536]
  └────────────────────────────────────────────────────────────────────┘
 W ∈ [1536, 1536]
 ```
+
+## Attention Layers
+```text
+           [input]
+              |
+      ┌───────┴──────┐
+      |       |      |
+   q_proj   k_proj v_proj
+      |       |      |
+      |       |      |
+      └─────Attention─────┐
+                          |
+                    [attn output]
+                          |
+                       o_proj
+                          |
+                     [output to next layer]

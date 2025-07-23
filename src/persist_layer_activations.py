@@ -7,6 +7,9 @@ from quantize.scrooge_awq_quantizer import ScroogeAwqQuantizer
 from pipelines.scrooge_quant_pipeline import load_model_and_tokenizer
 from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR
 import logging_config
+import nltk
+
+nltk.download("punkt")
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +25,18 @@ logger = logging.getLogger(__name__)
 # N_SAMPLES = 128
 # SEQ_LEN = 512
 
+# # Try this
+# SAVE_DIR = (
+#     DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR / "activation_linear_inputs_192_samples"
+# )
+# N_SAMPLES = 192
+# SEQ_LEN = 256
+
 # Try this
 SAVE_DIR = (
-    DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR / "activation_linear_inputs_192_samples"
+    DEEPSEEK_R1_DISTILL_QUANT_MODEL_OUTPUT_DIR / "activation_linear_inputs_256_samples"
 )
-N_SAMPLES = 192
+N_SAMPLES = 256
 SEQ_LEN = 256
 
 quant_config = {

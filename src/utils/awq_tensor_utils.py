@@ -3,9 +3,11 @@ utils/awq_tensor_utils.py
 Helper functions to help analyze tensors for quantization.
 """
 
+from pathlib import Path
 from typing import Optional
 import logging
 import torch
+import safetensors.torch as st
 import logging_config
 
 logger = logging.getLogger(__name__)
@@ -67,33 +69,44 @@ def unpack_qweight_4bit_int32(qweight: torch.Tensor) -> torch.Tensor:
     return unpacked
 
 
-def dequantize_awq_weights(
+def dequantize_qweights(
     qweight: torch.Tensor,
     scales: torch.Tensor,
     group_size: int,
     qzeros: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Dequantize AWQ-style quantized weights, with optional per-group zero-points.
+    Dequantize AWQ-style quantized weights using group-wise scales and
+    optional group-wise zero points.
 
-    This function reconstructs float32 weights using:
-        W_fp32 = (Q - Z) * S  if qzeros is provided
-        W_fp32 = Q * S        if qzeros is None
+    This function reconstructs float32 weights from unpacked int8 quantized weights.
+    For each group of input features, it applies the corresponding scale
+    (and zero point if provided):
+
+        W_fp32 = (Q - Z) * S  if qzeros is provided (asymmetric quantization)
+        W_fp32 = Q * S        if qzeros is None (symmetric quantization)
 
     Args:
-        qweight (torch.Tensor): Unpacked quantized weights [O, I], dtype torch.int8
-        scales (torch.Tensor): Per-group scales [O, G], where G = I // group_size
-        group_size (int): Number of input features per group (e.g., 128)
-        qzeros (torch.Tensor, optional): Unpacked zero points [O, I],
-            dtype torch.int8 or torch.uint8
+        qweight (torch.Tensor): Unpacked quantized weights, shape [out_features, in_features],
+            dtype torch.int8.
+        scales (torch.Tensor): Group-wise scales, shape [out_features, num_groups],
+            dtype float16 or float32.
+        group_size (int): Number of input features per group (typically 128, but may differ
+            per layer).
+        qzeros (Optional[torch.Tensor]): Optional group-wise zero points,
+                                            shape [out_features, num_groups],
+                                            dtype torch.int8 or torch.uint8.
+                                            If None, symmetric quantization is assumed.
 
     Returns:
-        torch.Tensor: Dequantized weights [O, I], dtype torch.float32
+        torch.Tensor: Dequantized weights, shape [out_features, in_features],
+        dtype torch.float32.
 
     Raises:
-        ValueError: If input shapes are incompatible.
+        TypeError: If input dtypes are incorrect.
+        ValueError: If input shapes are incompatible or inconsistent with group_size.
 
-    Examples:
+    Example:
         >>> qweight = torch.randint(-8, 8, (4, 16), dtype=torch.int8)
         >>> scales = torch.rand(4, 4) * 0.05  # for group_size = 4
         >>> w_fp32 = dequantize_awq_weights(qweight, scales, group_size=4)
@@ -138,7 +151,7 @@ def dequantize_awq_weights(
     return w_fp32
 
 
-def load_tensor_from_safetensors(path: str, tensor_name: str) -> torch.Tensor:
+def load_tensor_from_safetensors(path: str | Path, tensor_name: str) -> torch.Tensor:
     """
     Load a specific tensor by name from a .safetensors file.
 
@@ -150,7 +163,7 @@ def load_tensor_from_safetensors(path: str, tensor_name: str) -> torch.Tensor:
     Returns:
         torch.Tensor: Loaded tensor.
     """
-    import safetensors.torch as st
+    path = str(path) if isinstance(path, Path) else path
 
     tensors = st.load_file(path)
     if tensor_name not in tensors:
