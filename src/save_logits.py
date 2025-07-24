@@ -4,7 +4,10 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from awq import AutoAWQForCausalLM
-from project_config import DEEPSEEK_R1_DISTILL_QUANT_MODEL_DIR
+from project_config import (
+    DEEPSEEK_R1_DISTILL_QUANT_MODEL_DIR,
+    DEEPSEEK_R1_DISTILL_HANSEN_QUANT_MODEL_DIR,
+)
 
 
 # * --- CONFIG ---
@@ -48,8 +51,7 @@ torch.save(
     saved_dir / "generated_logits_fp.pt",
 )
 
-logger.info
-
+print("FP model logits saved.")
 del model_fp
 torch.cuda.empty_cache()
 
@@ -87,3 +89,41 @@ torch.save(
 
 del model_q
 torch.cuda.empty_cache()
+print("Scrooge model logits saved.")
+
+
+# * --- Quantized model: Hansen Model---
+model_q = AutoAWQForCausalLM.from_quantized(
+    DEEPSEEK_R1_DISTILL_HANSEN_QUANT_MODEL_DIR,
+    device_map="auto",
+    fuse_layers=False,
+    trust_remote_code=True,
+)
+tokenizer_q = AutoTokenizer.from_pretrained(DEEPSEEK_R1_DISTILL_QUANT_MODEL_DIR)
+
+device = next(model_q.parameters()).device
+inputs = tokenizer_q(prompt, return_tensors="pt")
+inputs = {k: v.to(device) for k, v in inputs.items()}
+
+logits_q = []
+with torch.no_grad():
+    for _ in range(n_tokens_to_generate):
+        out = model_q(**inputs)
+        logits = out.logits[:, -1, :]  # logits for next token
+        logits_q.append(logits.cpu())
+
+        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        inputs["input_ids"] = torch.cat([inputs["input_ids"], next_token], dim=-1)
+
+torch.save(
+    {
+        "prompt": prompt,
+        "generated_ids": input_ids.cpu(),
+        "logits_q": logits_q,
+    },
+    saved_dir / "generated_logits_hansen.pt",
+)
+
+del model_q
+torch.cuda.empty_cache()
+print("Hansen model logits saved.")

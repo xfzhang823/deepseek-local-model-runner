@@ -37,8 +37,8 @@ def main():
     # Run quantization pipeline
     run_scrooge_quant_pipeline(
         # save_dir_path=save_path,
-        max_calib_samples=128,  # Set it slightly than the official idea size
-        max_calib_seq_len=256,  # Set it half the official size
+        max_calib_samples=48,
+        max_calib_seq_len=768,  # Set it higher for the reasoning model
         apply_clip=True,
     )
 

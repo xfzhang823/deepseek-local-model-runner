@@ -144,6 +144,7 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         group_size: int = 128,
         save_per_layer: bool = True,
         version: str = "gemm",
+        modules_to_not_convert: List[str] = [],  #! include ALL layers!
     ):
         """
         * Need to set __init__ b/c we are "hijacking" the official autoawq model
@@ -227,10 +228,9 @@ class ScroogeAwqQuantizer(AwqQuantizer):
         )
 
         # ✅ Others:
-        self.modules_to_not_convert = [
-            "embed_tokens",
-            "lm_head",
-        ]  # Exclude just the first and last layer
+        self.modules_to_not_convert: list[str] = (
+            modules_to_not_convert  # ☑️ include ALL layers!
+        )
         self.max_chunk_memory = 64 * 1024 * 1024  # 64 MB
 
         # * standard default is 1024 MB (too large for most consumer laptop GPUs)

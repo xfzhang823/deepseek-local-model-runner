@@ -71,9 +71,9 @@ for name, mod in model.named_modules():
         mod.register_forward_hook(check_nan_hook(name))
 
 # Run a test prompt
-prompt = "What is the capital of France?"
+# prompt = "What is the capital of France?"
 # prompt = "法国的首都是哪里？"
-# prompt = "What is 1 + 1?"
+prompt = "What is 1 + 1?"
 
 inputs = tokenizer(prompt, return_tensors="pt").to(next(model.parameters()).device)
 input_ids = inputs["input_ids"]  # <--- This is the tensor
@@ -127,7 +127,7 @@ audit_quantized_layers_in_memory(model)
 outputs = model.generate(
     **inputs,
     max_new_tokens=128,
-    do_sample=True,
+    do_sample=False,
     temperature=0.6,
     top_p=0.9,
     top_k=50,

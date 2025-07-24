@@ -52,7 +52,8 @@ audit_df.to_csv(csv_file, index=False)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 # Run a test prompt
-prompt = "What is the capital of France?"
+# prompt = "What is the capital of France?"
+prompt = "What is 1 + 1?"
 inputs = tokenizer(prompt, return_tensors="pt").to(next(model.parameters()).device)
 
 with torch.no_grad():

@@ -1,4 +1,5 @@
 import sys
+import logging
 import torch
 from typing import Dict, List, Tuple, Any, Optional, TextIO
 from safetensors.torch import load_file
@@ -8,6 +9,8 @@ from utils.awq_tensor_utils import (
     unpack_qzeros_4bit_int32,
     dequantize_qweights,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def unpack_and_dequantize_weights(
@@ -108,29 +111,25 @@ def unpack_and_dequantize_weights(
             O, I = qw.shape
             O2, G = sc.shape
             if O != O2:
-                print(f"Skipping {base}: out_features mismatch {O} vs {O2}")
+                logger.info(f"Skipping {base}: out_features mismatch {O} vs {O2}")
                 continue
             if I % G != 0:
-                print(
+                logger.info(
                     f"Skipping {base}: in_features ({I}) not divisible by num_groups ({G})"
                 )
                 continue
             if qz.shape != sc.shape:
-                print(
+                logger.info(
                     f"Skipping {base}: qzeros shape {qz.shape} does not match scales {sc.shape}"
                 )
                 continue
 
             group_size = I // G
 
-            print(
-                f"[{base}] qweight.shape: {qw.shape}, qzeros.shape: {qz.shape}, scales.shape: {sc.shape}, group_size: {group_size}"
-            )
-
             deq = dequantize_qweights(qw, sc, group_size, qz)
             deq_weights[base] = deq
             unpacked_artifacts[base] = {"qweight": qw, "qzeros": qz, "scales": sc}
         except Exception as e:
-            print(f"Skipping {base}: {e}")
+            logger.info(f"Skipping {base}: {e}")
 
     return deq_weights, unpacked_artifacts
